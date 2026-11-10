@@ -2,7 +2,7 @@
 // Model dosyaları transformers.js tarafından ayrıca "transformers-cache" içinde saklanır.
 // Claude API ve Hugging Face isteklerine dokunulmaz.
 
-const VERSION = 'kd-v2';
+const VERSION = 'kd-v3';
 const APP_FILES = [
   './',
   './index.html',
@@ -37,6 +37,8 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== self.location.origin) return;
+  // Model dosyalarını (models/) transformers.js kendi önbelleğinde saklar; ikinci kopya tutma.
+  if (url.pathname.includes('/models/')) return;
   // Önce ağ (güncel sürüm), ağ yoksa önbellek. Büyük vendor dosyaları için önce önbellek.
   const big = url.pathname.includes('/vendor/');
   e.respondWith((async () => {

@@ -21,22 +21,38 @@ export const MODELS = {
     tiny: { id: 'onnx-community/whisper-tiny', mb: 41 },
     base: { id: 'onnx-community/whisper-base', mb: 77 },
     small: { id: 'onnx-community/whisper-small', mb: 249 },
+    // Türkçe'ye ince ayarlı whisper-base (aynı boyut ve bellek). Ağırlıkları onnx-community'nin
+    // q8 grafiklerine aktarılarak dönüştürüldü; dosyalar uygulamanın kendi sitesinden (models/) sunulur.
+    'base-tr': { id: 'whisper-base-tr', mb: 77, local: true, lang: 'turkish' },
   },
 };
+
+const HF_HOST = 'https://huggingface.co/';
+const HF_TEMPLATE = '{model}/resolve/{revision}/';
+
+/** Seçilen model, seçilen dille kullanılabilir mi? (Türkçe model yalnızca Türkçe için) */
+export function asrModelFor(size, language) {
+  const m = MODELS.asr[size];
+  if (!m) return 'base';
+  if (m.lang && language !== m.lang) return 'base';
+  return size;
+}
 
 /**
  * Seçili kurulum için gereken model dosyalarının adresleri (transformers.js'in
  * önbellek anahtarlarıyla birebir aynı). "Modelleri indir" düğmesi bunları belleğe
  * yüklemeden doğrudan Cache Storage'a indirir.
+ * @param {string} localBase  yerel modellerin kök adresi (ör. https://…/stt-app/models/)
  */
-export function modelFiles(asrSize = 'base') {
-  const hf = (repo, f) => `https://huggingface.co/${repo}/resolve/main/${f}`;
-  const asr = (MODELS.asr[asrSize] || MODELS.asr.base).id;
+export function modelFiles(asrSize = 'base', localBase = '') {
+  const hf = (repo, f) => `${HF_HOST}${repo}/resolve/main/${f}`;
+  const m = MODELS.asr[asrSize] || MODELS.asr.base;
+  const asrUrl = (f) => (m.local ? `${localBase}${m.id}/${f}` : hf(m.id, f));
   return [
     ...['config.json', 'preprocessor_config.json', 'onnx/model.onnx'].map((f) => hf(MODELS.segmentation, f)),
     ...['config.json', 'preprocessor_config.json', 'onnx/model.onnx'].map((f) => hf(MODELS.embedding, f)),
     ...['config.json', 'generation_config.json', 'preprocessor_config.json', 'tokenizer.json', 'tokenizer_config.json',
-      'onnx/encoder_model_quantized.onnx', 'onnx/decoder_model_merged_quantized.onnx'].map((f) => hf(asr, f)),
+      'onnx/encoder_model_quantized.onnx', 'onnx/decoder_model_merged_quantized.onnx'].map(asrUrl),
   ];
 }
 
@@ -66,9 +82,10 @@ export class Engine {
    * @param {any} T transformers.js modülü
    * @param {{diarDevice?: string}} opt  tarayıcıda 'wasm', Node'da 'cpu'
    */
-  constructor(T, { diarDevice = 'wasm', lowMemory = true } = {}) {
+  constructor(T, { diarDevice = 'wasm', lowMemory = true, localBase = null } = {}) {
     this.T = T;
     this.diarDevice = diarDevice;
+    this.localBase = localBase; // yerel (sitede barındırılan) modellerin kök adresi
     // Telefonlarda bellek sınırı dar: ONNX graf optimizasyonu, model ağırlıklarının
     // geçici kopyalarını oluşturup WebAssembly belleğini kalıcı olarak büyütüyor.
     // Kapatınca tepe bellek ~150-190 MB düşüyor (metne çevirme ~%50 yavaşlıyor).
@@ -105,7 +122,14 @@ export class Engine {
     if (this.asr && this.asrKey === key) return;
     if (this.asr) { try { await this.asr.dispose(); } catch { /* yoksay */ } this.asr = null; }
     const m = MODELS.asr[size] || MODELS.asr.base;
-    const dtype = device === 'webgpu'
+    // Yerel model: dosyaları Hugging Face yerine uygulamanın kendi sitesinden al.
+    // (Node testlerinde localBase verilmez; orada env.localModelPath kullanılır.)
+    if (this.localBase) {
+      this.T.env.remoteHost = m.local ? this.localBase : HF_HOST;
+      this.T.env.remotePathTemplate = m.local ? '{model}/' : HF_TEMPLATE;
+    }
+    // Yerel (Türkçe) modelin yalnızca q8 dosyaları var; GPU'da da onları kullan.
+    const dtype = device === 'webgpu' && !m.local
       ? { encoder_model: 'fp32', decoder_model_merged: 'q4' }
       : { encoder_model: 'q8', decoder_model_merged: 'q8' };
     const session_options = device === 'webgpu' ? {} : this.sessionOptions;

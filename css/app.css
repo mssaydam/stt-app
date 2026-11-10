@@ -227,6 +227,11 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .sheet .menu button:last-child { border-bottom: 0; }
 .sheet .menu button.danger { color: var(--danger); }
 
+.fix-row { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.fix-row input { width: 22px; height: 22px; margin-top: 2px; flex: none; accent-color: var(--accent); }
+.d-ins { color: var(--ok); text-decoration: none; font-weight: 650; }
+.d-del { color: var(--danger); }
+
 .toast {
   position: fixed; left: 50%; bottom: calc(var(--safe-bottom) + 140px); transform: translateX(-50%);
   z-index: 80; background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 12px;

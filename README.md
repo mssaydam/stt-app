@@ -13,8 +13,9 @@ konuşmanın *metnini* Claude'a (varsayılan: Claude Opus 5.5) gönderip özet �
 | Konuşmacı ayırma ("kim ne zaman konuştu") — pyannote 3.0 | Telefon | Hayır |
 | Konuşmacı tanıma (bir kez "Bu sesi tanı" deyin, sonraki kayıtlarda adıyla gelsin) — WeSpeaker | Telefon | Hayır |
 | Konuşma → metin — Whisper tiny/base/small | Telefon | Hayır |
-| Metni düzeltme, konuşmacı değiştirme/birleştirme, arama | Telefon | Hayır |
+| Metni elle düzeltme, konuşmacı değiştirme/birleştirme, arama | Telefon | Hayır |
 | Dışa aktarma (.txt / .md / .json, paylaş menüsü, panoya kopyala) | Telefon | Hayır |
+| **Metni düzelt** (yanlış duyulan kelimeleri bağlamdan düzeltir; öneriler tek tek onaylanır, geri alınabilir) — Claude | Anthropic API | Evet, yalnızca metin |
 | **Özetle** (karar, yapılacaklar, takip soruları) — Claude | Anthropic API | Evet, yalnızca metin |
 | **Soru sor** (tek kayıt veya seçilen birden çok kayıt) — Claude | Anthropic API | Evet, yalnızca metin |
 

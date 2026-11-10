@@ -1,7 +1,7 @@
 // Konuşma Defteri — arayüz ve uygulama akışı.
 import { db, uid } from './db.js';
-import { ask, explainError, hasKey, transcriptText, fmtTime, SUMMARY_PROMPT, CLAUDE_MODELS } from './claude.js';
-import { modelFiles } from './engine.js';
+import { ask, correctTranscript, explainError, hasKey, transcriptText, fmtTime, SUMMARY_PROMPT, CLAUDE_MODELS } from './claude.js';
+import { modelFiles, asrModelFor } from './engine.js';
 
 // ====================================================================
 // Yardımcılar
@@ -30,7 +30,7 @@ const ICON = {
 // ====================================================================
 // Ayarlar (yalnızca bu cihazda, localStorage)
 // ====================================================================
-export const APP_VERSION = '1.1.0';
+export const APP_VERSION = '1.2.0';
 const DEFAULTS = {
   v: 2,
   asrModel: 'base',          // tiny | base | small
@@ -344,9 +344,11 @@ async function pump() {
     rec.turns = result.turns;
     rec.status = 'done';
     rec.crashes = 0;
-    rec.processedWith = { asrModel: ws.asrModel, device: result.device, at: Date.now(), version: APP_VERSION };
+    rec.processedWith = { asrModel: result.model || ws.asrModel, device: result.device, at: Date.now(), version: APP_VERSION };
     await saveRec(rec);
     if (!settings.keepAudio) await db.del('audio', id);
+    // Birleştirilmiş son metni ve Claude kartını (artık kullanılabilir) hemen göster
+    if (isViewing(id)) { renderDetailParts(rec); renderClaude(rec); }
     toast(`“${rec.title}” hazır`);
   } catch (err) {
     console.error(err);
@@ -707,7 +709,7 @@ async function renderDetail(id) {
   view().innerHTML = `
     <div id="d-status"></div>
     <div class="card">
-      <div class="row"><span class="muted small">${fmtDate(r.createdAt)} · ${fmtTime(r.duration)}</span></div>
+      <div class="row"><span class="muted small" id="d-meta">${fmtDate(r.createdAt)} · ${fmtTime(r.duration)}</span></div>
       <div id="d-audio"></div>
     </div>
     <div class="card"><h2>Konuşmacılar</h2><div id="d-speakers" class="chips"></div>
@@ -763,6 +765,8 @@ function renderStatus(r) {
 }
 
 function renderDetailParts(r) {
+  const meta = $('#d-meta');
+  if (meta) meta.textContent = `${fmtDate(r.createdAt)} · ${fmtTime(r.duration)}`;
   const sp = $('#d-speakers');
   if (sp) {
     sp.innerHTML = (r.speakers || []).map((s, i) => `<button class="chip" data-spk="${i}"><span class="sw" style="background:${spkColor(i)}"></span>${esc(speakerName(r, i))}${s.profileId ? '<span class="badge" title="Tanınan kişi">✓</span>' : ''}<span class="small muted">${fmtTime(s.duration)}</span></button>`).join('')
@@ -795,9 +799,21 @@ async function moreMenu(r) {
     ...(hasAudio ? [{ label: 'Yeniden işle (farklı ayarlarla)', value: 'reprocess' }] : []),
     ...(hasAudio ? [{ label: 'Ses dosyasını paylaş/kaydet', value: 'audio' }] : []),
     ...(hasAudio ? [{ label: 'Sesi sil, yalnızca metni sakla', value: 'delaudio', danger: true }] : []),
+    ...(r.originalTurns ? [{ label: 'Claude düzeltmelerini geri al', value: 'undofix' }] : []),
     { label: 'Kaydı tamamen sil', value: 'delete', danger: true },
   ];
   const v = await menu(r.title, items);
+  if (v === 'undofix') {
+    const ok = await confirmBox('Düzeltmeler geri alınsın mı?', 'Metin, Claude ile düzeltmeden önceki hâline döner (sonradan elle yaptığınız değişiklikler de geri alınır).', 'Geri al');
+    if (ok) {
+      r.turns = r.originalTurns;
+      r.originalTurns = undefined;
+      await saveRec(r);
+      renderDetailParts(r); renderClaude(r);
+      toast('Orijinal metne dönüldü');
+    }
+    return;
+  }
   if (v === 'title') {
     const t = await promptBox('Başlık', r.title);
     if (t) { r.title = t; await saveRec(r); render(); }
@@ -925,6 +941,8 @@ async function turnMenu(r, i) {
 function renderClaude(r) {
   const el = $('#d-claude');
   if (!el) return;
+  const draft = $('#c-q')?.value || ''; // yazılmakta olan soruyu yeniden çizimde kaybetme
+  queueMicrotask(() => { const q = $('#c-q'); if (q && draft && !q.value) q.value = draft; });
   const ready = r.status === 'done' && r.turns?.length;
   const sum = r.summaries?.[r.summaries.length - 1];
   const key = hasKey(settings);
@@ -936,7 +954,9 @@ function renderClaude(r) {
     ${key && !ready ? '<p class="small muted">Metin hazır olduğunda özetleyebilir ve soru sorabilirsiniz.</p>' : ''}
     ${key && ready ? `
       <div id="c-summary">${sum ? `<div class="md">${md(sum.text)}</div><p class="small muted">${esc(sum.model)} · ${fmtDate(sum.createdAt)} · ${usageText(sum.usage)}</p>` : ''}</div>
-      <div class="btn-row"><button class="btn ${sum ? '' : 'primary'}" id="c-sum">${sum ? 'Yeniden özetle' : 'Özetle'}</button></div>
+      <div class="btn-row"><button class="btn ${sum ? '' : 'primary'}" id="c-sum">${sum ? 'Yeniden özetle' : 'Özetle'}</button>
+        <button class="btn" id="c-fix">Metni düzelt</button></div>
+      <p class="small muted" style="margin:8px 0 0"><b>Metni düzelt:</b> yanlış duyulan kelimeleri bağlamdan düzeltir (ör. “kutumu” → “kotumu”). Değişiklikleri uygulamadan önce tek tek görürsünüz.</p>
       <p class="small muted" style="margin:8px 0 0">Gönderilecek: yalnızca metin (~${words(r.turns.map((t) => t.text).join(' '))} kelime). Ses gönderilmez.</p>
       <hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
       <div class="row"><b>Soru sor</b><span class="spacer"></span>${r.chat?.length ? '<button class="icon-btn small" id="c-clear">Temizle</button>' : ''}</div>
@@ -945,6 +965,7 @@ function renderClaude(r) {
         <button class="btn primary" id="c-send" aria-label="Gönder">${ICON.send}</button></div>` : ''}`;
   if (!(key && ready)) return;
   $('#c-sum').onclick = () => summarize(r);
+  $('#c-fix').onclick = () => fixTranscript(r);
   $('#c-send').onclick = () => sendQuestion(r);
   $('#c-clear')?.addEventListener('click', async () => {
     if (await confirmBox('Sohbet temizlensin mi?', 'Bu kayıttaki sorular ve yanıtlar silinecek.', 'Temizle', true)) { r.chat = []; await saveRec(r); renderClaude(r); }
@@ -968,6 +989,61 @@ function claudeBusy(btn, label) {
   const old = btn.innerHTML;
   btn.innerHTML = label;
   return { ac, done: () => { state.busyClaude = null; btn.innerHTML = old; } };
+}
+
+/** Kelime düzeyinde fark: eski metinde silinenler kırmızı, yenide eklenenler yeşil. */
+function wordDiff(a, b) {
+  const x = a.split(/\s+/).filter(Boolean), y = b.split(/\s+/).filter(Boolean);
+  const n = x.length, m = y.length;
+  const L = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = x[i] === y[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && x[i] === y[j]) { out.push(esc(x[i])); i++; j++; }
+    // önce silinen (eski) kelime, sonra eklenen (yeni) kelime gösterilsin
+    else if (i < n && (j >= m || L[i + 1][j] >= L[i][j + 1])) { out.push(`<del class="d-del">${esc(x[i])}</del>`); i++; }
+    else { out.push(`<ins class="d-ins">${esc(y[j])}</ins>`); j++; }
+  }
+  return out.join(' ');
+}
+
+/** "Metni düzelt": Claude yalnızca metni görür; öneriler onaylanmadan uygulanmaz. */
+async function fixTranscript(r) {
+  if (!navigator.onLine) { toast('Düzeltme için internet bağlantısı gerekir.'); return; }
+  const btn = $('#c-fix');
+  const b = claudeBusy(btn, 'Durdur');
+  if (!b) return;
+  const t0 = Date.now();
+  const tick = setInterval(() => { if (btn.isConnected) btn.textContent = `Düzeltiliyor… ${Math.round((Date.now() - t0) / 1000)} sn`; }, 1000);
+  let res;
+  try {
+    res = await correctTranscript(settings, r, speakerName, { signal: b.ac.signal });
+  } catch (err) {
+    toast(explainError(err), 6000);
+    return;
+  } finally {
+    clearInterval(tick);
+    b.done();
+  }
+  if (!res.changes.length) { toast('Claude düzeltilecek bir şey bulmadı.'); return; }
+  const picked = await sheet(`<h3>Önerilen düzeltmeler (${res.changes.length})</h3>
+    <p class="small muted">${esc(res.model)} · ${usageText(res.usage)}</p>
+    <div>${res.changes.map((c, k) => `<label class="fix-row">
+      <input type="checkbox" data-k="${k}" checked>
+      <span><span class="small muted">${esc(speakerName(r, r.turns[c.i].spk))} · ${fmtTime(r.turns[c.i].start)}</span><br>${wordDiff(c.old, c.text)}</span></label>`).join('')}</div>
+    <div class="btn-row" style="margin-top:12px"><button class="btn" data-a="no">Vazgeç</button><button class="btn primary" data-a="ok">Seçilenleri uygula</button></div>`,
+  (el, close) => {
+    $('[data-a=no]', el).onclick = () => close(null);
+    $('[data-a=ok]', el).onclick = () => close($$('input[data-k]', el).filter((c) => c.checked).map((c) => res.changes[+c.dataset.k]));
+  });
+  if (!picked?.length) return;
+  if (!r.originalTurns) r.originalTurns = r.turns.map((t) => ({ ...t }));
+  for (const c of picked) r.turns[c.i].text = c.text;
+  r.corrections = [...(r.corrections || []), { at: Date.now(), model: res.model, count: picked.length, usage: res.usage }];
+  await saveRec(r);
+  if (isViewing(r.id)) { renderDetailParts(r); renderClaude(r); }
+  toast(`${picked.length} satır düzeltildi. Geri almak için: ⋯ → “Claude düzeltmelerini geri al”`, 4500);
 }
 
 async function summarize(r) {
@@ -1094,11 +1170,12 @@ function renderPeople() {
 
 // ---------------- Ayarlar ----------------
 /** Seçili model kurulumunun tüm dosyaları önbellekte mi? → { ok, missing[] } */
+const LOCAL_MODELS = new URL('../models/', import.meta.url).href;
 async function modelCacheStatus(size = settings.asrModel) {
   try {
     const c = await caches.open('transformers-cache');
     const have = new Set((await c.keys()).map((k) => k.url));
-    const missing = modelFiles(size).filter((u) => !have.has(u));
+    const missing = modelFiles(asrModelFor(size, settings.language), LOCAL_MODELS).filter((u) => !have.has(u));
     return { ok: missing.length === 0, missing };
   } catch (e) { return { ok: false, missing: [], error: String(e) }; }
 }

@@ -6,9 +6,10 @@
 // küçülmediği için, iki aşamayı aynı işçide yapmak telefonda belleği aşıyordu.
 
 import * as T from '../vendor/transformers.min.js';
-import { Engine, matchProfiles } from './engine.js';
+import { Engine, matchProfiles, asrModelFor } from './engine.js';
 
 const VENDOR = new URL('../vendor/', import.meta.url).href;
+const LOCAL_MODELS = new URL('../models/', import.meta.url).href; // sitede barındırılan Türkçe model
 T.env.allowLocalModels = false;
 T.env.useBrowserCache = true; // modeller bir kez indirilir, sonra Cache Storage'dan okunur
 T.env.backends.onnx.wasm.numThreads = 1; // iOS'ta crossOriginIsolated yok
@@ -21,7 +22,7 @@ function useBackend(device) {
     : { mjs: VENDOR + 'ort-wasm-simd-threaded.mjs', wasm: VENDOR + 'ort-wasm-simd-threaded.wasm' };
 }
 
-const engine = new Engine(T, { diarDevice: 'wasm', lowMemory: true });
+const engine = new Engine(T, { diarDevice: 'wasm', lowMemory: true, localBase: LOCAL_MODELS });
 const post = (type, data = {}, transfer) => self.postMessage({ type, ...data }, transfer || []);
 
 // İndirme ilerlemesini dosya bazında topla
@@ -67,14 +68,15 @@ self.onmessage = async (ev) => {
       const device = settings.device === 'webgpu' ? 'webgpu' : 'wasm';
       useBackend(device);
       setStage('load-asr', { device });
-      await engine.loadASR(settings.asrModel || 'base', device, progressTracker('load-asr'));
+      const size = asrModelFor(settings.asrModel || 'base', settings.language || 'turkish');
+      await engine.loadASR(size, device, progressTracker('load-asr'));
       setStage('asr', { device });
       const turns = await engine.transcribeTurns(audio, segments, {
         language: settings.language || 'turkish',
         onProgress: (v) => post('progress', { stage: 'asr', value: v }),
         onTurn: (t) => post('turn', { id, turn: t }),
       });
-      post('done', { id, turns, device });
+      post('done', { id, turns, device, model: size });
     } else if (type === 'info') {
       let webgpu = false;
       try { webgpu = !!(self.navigator.gpu && await self.navigator.gpu.requestAdapter()); } catch { /* yok */ }
