@@ -526,6 +526,20 @@ export function repetitive(text) {
 /** Whisper'ın uydurduğu tekrarları ve bilinen kalıp cümleleri temizle. */
 export function cleanText(text) {
   let t = text.replace(/\s+/g, ' ').trim();
+  // Türkçe model bazen tüm cümleyi tırnak içine alıyor ('Gelin, siz de …') → dış tırnakları at.
+  // Kelime içindeki kesme işaretlerine (Barajı'nın) dokunulmaz.
+  const q = t.match(/^(['‘’]|["“”])/);
+  if (q) {
+    const dbl = /["“”]/.test(q[1]);
+    const rest = t.slice(1);
+    const wrapped = /['"‘’“”]$/.test(rest);
+    // tek tırnak: Türkçe cümle kesme işaretiyle başlamaz → at.
+    // çift tırnak: yalnızca tüm cümleyi sarıyorsa ya da metinde eşi yoksa at (gerçek alıntıyı bozma).
+    if (!dbl || wrapped || !/["“”]/.test(rest)) {
+      t = rest.trimStart();
+      if (wrapped) t = t.replace(/(?<=[\p{L}\p{N}.!?,…])\s*['"‘’“”]+$/u, '');
+    }
+  }
   // aynı kelimenin art arda 3'ten fazla tekrarı → 1'e indir
   t = t.replace(/(\S+?)([\s,.;!?]+\1(?=[\s,.;!?]|$)){2,}/giu, '$1');
   const junk = [

@@ -12,15 +12,16 @@ konuşmanın *metnini* Claude'a (varsayılan: Claude Opus 5.5) gönderip özet �
 | Ses dosyası içe aktarma (Sesli Notlar, WhatsApp sesi, m4a/mp3/wav…) | Telefon | Hayır |
 | Konuşmacı ayırma ("kim ne zaman konuştu") — pyannote 3.0 | Telefon | Hayır |
 | Konuşmacı tanıma (bir kez "Bu sesi tanı" deyin, sonraki kayıtlarda adıyla gelsin) — WeSpeaker | Telefon | Hayır |
-| Konuşma → metin — Whisper tiny/base/small | Telefon | Hayır |
+| Konuşma → metin — Türkçe'ye ince ayarlı Whisper (varsayılan) veya çok dilli tiny/base/small | Telefon | Hayır |
 | Metni elle düzeltme, konuşmacı değiştirme/birleştirme, arama | Telefon | Hayır |
 | Dışa aktarma (.txt / .md / .json, paylaş menüsü, panoya kopyala) | Telefon | Hayır |
 | **Metni düzelt** (yanlış duyulan kelimeleri bağlamdan düzeltir; öneriler tek tek onaylanır, geri alınabilir) — Claude | Anthropic API | Evet, yalnızca metin |
 | **Özetle** (karar, yapılacaklar, takip soruları) — Claude | Anthropic API | Evet, yalnızca metin |
 | **Soru sor** (tek kayıt veya seçilen birden çok kayıt) — Claude | Anthropic API | Evet, yalnızca metin |
 
-- İnternet yalnızca iki şey için kullanılır: (1) ilk kullanımda modellerin Hugging Face'ten
-  **indirilmesi** (≈90 MB, "small" modelle ≈260 MB) ve (2) sizin bastığınız Claude düğmeleri.
+- İnternet yalnızca iki şey için kullanılır: (1) ilk kullanımda modellerin **indirilmesi**
+  (≈110 MB: Türkçe model bu sitenin kendisinden, konuşmacı modelleri Hugging Face'ten) ve
+  (2) sizin bastığınız Claude düğmeleri.
 - Sayfanın güvenlik politikası (CSP) yalnızca kendi dosyalarına, `huggingface.co` / `*.hf.co`
   ve `api.anthropic.com` adreslerine bağlantıya izin verir. Ses için yükleme kodu yoktur.
 - Claude isteklerinde ses yok, yalnızca metin var; Claude hiçbir zaman otomatik çağrılmaz.
@@ -45,11 +46,19 @@ Uygulama statik bir web sitesidir (sunucu kodu yok); bu depo GitHub Pages ile ya
 
 ## Model seçimi, hız ve bellek
 
-| Model | İndirme | Türkçe doğruluk | İşlem sırasında tepe bellek* | Süre* |
+| Model | İndirme | Türkçe kelime hatası (WER)† | İşlem sırasında tepe bellek* | Süre* |
 |---|---|---|---|---|
-| tiny | ~41 MB | zayıf | ~560 MB | 47 sn |
-| base (varsayılan) | ~77 MB | orta | ~670 MB | 84 sn |
-| small | ~250 MB | iyi | ~1,2 GB — **iPhone'da sığmayabilir** | 142 sn |
+| **Türkçe – base-tr (varsayılan)** | ~77 MB | **%18,6** | ~700 MB | ~73 sn |
+| tiny (çok dilli) | ~41 MB | (~%65‡) | ~560 MB | 47 sn |
+| base (çok dilli) | ~77 MB | %31,5 | ~700 MB | ~95 sn |
+| small (çok dilli) | ~250 MB | %18,2 | ~1,2 GB — **iPhone'da sığmayabilir** | 142 sn |
+
+† 100 FLEURS tr + 120 TBMM konuşması (2026), normalleştirilmiş; ayrıntı: `models/whisper-base-tr/README.md`.
+‡ Ölçmedim; turkmedstt/turkish-asr-benchmark tablosundaki değer (farklı test seti).
+
+“Türkçe” model, [ysdede/whisper-base-turkish-1.1](https://huggingface.co/ysdede/whisper-base-turkish-1.1)
+ağırlıklarının telefona dönüştürülmüş hâlidir (`tools/convert/`); boyutu, hızı ve belleği çok dilli
+`base` ile aynıdır. Türkçe dışı bir dil seçilirse otomatik olarak çok dilli model kullanılır.
 
 \* Masaüstü Chromium (CPU/WASM, tek iş parçacığı), 80 sn'lik 3 kişilik test sesi. **iPhone'da ölçülmedi**;
 iOS bir web sayfasına sınırlı bellek verir ve aşılırsa sayfayı kapatıp yeniden yükler

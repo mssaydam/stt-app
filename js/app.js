@@ -32,8 +32,8 @@ const ICON = {
 // ====================================================================
 export const APP_VERSION = '1.2.0';
 const DEFAULTS = {
-  v: 2,
-  asrModel: 'base',          // tiny | base | small
+  v: 3,
+  asrModel: 'base-tr',       // base-tr (Türkçe) | tiny | base | small
   device: 'wasm',            // wasm (CPU) | webgpu (deneysel)
   language: 'turkish',
   threshold: 0.45,           // konuşmacı ayırma: yüksek → daha çok kişi
@@ -51,6 +51,13 @@ const saveSettings = () => { try { localStorage.setItem('kd-settings', JSON.stri
 if (Object.keys(stored).length && (stored.v || 1) < 2) {
   settings.device = 'wasm';
   settings.v = 2;
+  saveSettings();
+}
+// 1.1 → 1.2: Türkçe'ye ince ayarlı model (aynı boyut, Türkçe testte hata oranı %31,5 → %18,6).
+// Varsayılan "base" kullananları ona geçir; bilerek tiny/small seçenlere dokunma.
+if (Object.keys(stored).length && (stored.v || 1) < 3) {
+  if (!stored.asrModel || stored.asrModel === 'base') settings.asrModel = 'base-tr';
+  settings.v = 3;
   saveSettings();
 }
 
@@ -821,9 +828,10 @@ async function moreMenu(r) {
     const n = await menu('Kaç kişi konuşuyor?', [{ label: 'Otomatik algıla', value: 0 }, ...[1, 2, 3, 4, 5, 6, 7, 8].map((k) => ({ label: `${k} kişi`, value: k }))]);
     if (n === null) return;
     const m = await menu('Konuşma tanıma modeli', [
+      { label: 'Türkçe (base-tr, ~77 MB) – önerilen', value: 'base-tr' },
       { label: 'Hızlı (tiny, ~41 MB)', value: 'tiny' },
-      { label: 'Dengeli (base, ~77 MB)', value: 'base' },
-      { label: 'En doğru (small, ~250 MB) – telefonda belleğe sığmayabilir', value: 'small' },
+      { label: 'Çok dilli (base, ~77 MB)', value: 'base' },
+      { label: 'Çok dilli büyük (small, ~250 MB) – telefonda belleğe sığmayabilir', value: 'small' },
     ]);
     if (!m) return;
     if (r.turns?.length && !(await confirmBox('Yeniden işlensin mi?', 'Mevcut metin ve metin üzerindeki düzeltmeleriniz yenisiyle değiştirilecek (özet ve sorular korunur).', 'Yeniden işle'))) return;
@@ -1238,8 +1246,8 @@ async function renderSettings() {
   const sel = (name, opts) => `<select data-k="${name}">${opts.map(([v, l]) => `<option value="${v}" ${String(settings[name]) === String(v) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   view().innerHTML = `
     <div class="card"><h2>Konuşma tanıma (cihazda)</h2>
-      <label class="field"><span>Model</span>${sel('asrModel', [['tiny', 'Hızlı – tiny (~41 MB)'], ['base', 'Dengeli – base (~77 MB, önerilen)'], ['small', 'En doğru – small (~250 MB) – iPhone\'da sığmayabilir']])}
-        <small>Büyük model Türkçe'de daha doğrudur ama daha yavaştır ve daha çok bellek ister. “small” işlem sırasında ~1,2 GB bellek kullanır; telefonlarda uygulamanın kapanmasına yol açabilir.</small></label>
+      <label class="field"><span>Model</span>${sel('asrModel', [['base-tr', 'Türkçe – base-tr (~77 MB, önerilen)'], ['tiny', 'Hızlı – tiny (~41 MB, çok dilli)'], ['base', 'Çok dilli – base (~77 MB)'], ['small', 'Çok dilli büyük – small (~250 MB) – iPhone\'da sığmayabilir']])}
+        <small>“Türkçe” model, Türkçe'ye özel eğitilmiş whisper-base'dir: aynı hız ve bellekle Türkçe testlerde kelime hatası %31,5 → %18,6 (çok dilli “small” ile aynı düzeyde). Türkçe dışı bir dil seçerseniz otomatik olarak çok dilli model kullanılır. “small” işlem sırasında ~1,2 GB bellek kullanır; telefonlarda uygulamanın kapanmasına yol açabilir.</small></label>
       <label class="field"><span>Dil</span>${sel('language', [['turkish', 'Türkçe'], ['auto', 'Otomatik algıla'], ['english', 'İngilizce'], ['german', 'Almanca'], ['arabic', 'Arapça'], ['russian', 'Rusça'], ['french', 'Fransızca']])}</label>
       <label class="field"><span>İşlemci</span>${sel('device', [['wasm', 'CPU – en uyumlu (önerilen)'], ['webgpu', 'GPU (WebGPU) – deneysel']])}
         <small id="gpu-info"></small></label>
@@ -1255,6 +1263,7 @@ async function renderSettings() {
     <div class="card"><h2>Çevrimdışı kullanım</h2>
       <p class="small muted" id="cache-st">Kontrol ediliyor…</p>
       <button class="btn block" id="dl-models">Seçili modelleri şimdi indir</button>
+      <button class="btn block hidden" id="rm-models" style="margin-top:8px">Kullanılmayan modelleri sil</button>
       <div class="progress hidden" id="dl-prog" style="margin-top:10px"><i></i></div>
       <p class="small muted" id="storage-st"></p>
     </div>
@@ -1289,7 +1298,7 @@ async function renderSettings() {
       <p>• Ses kaydı, konuşmacı ayırma ve metne dönüştürme tamamen bu telefonda yapılır. Ses dosyası hiçbir zaman internete gönderilmez.</p>
       <p>• İnternet yalnızca iki şey için kullanılır: (1) ilk kullanımda yapay zekâ modellerini Hugging Face'ten <i>indirmek</i>; (2) siz istediğinizde konuşma <i>metnini</i> Claude'a göndermek.</p>
       <p>• Sayfanın güvenlik politikası (CSP) başka hiçbir adrese bağlantıya izin vermez.</p>
-      <p>Modeller: Whisper (OpenAI, MIT), pyannote segmentation 3.0 (MIT), WeSpeaker ResNet34 (Apache-2.0) · transformers.js, ONNX Runtime.</p>
+      <p>Modeller: Whisper (OpenAI, MIT), Türkçe whisper-base: ysdede/whisper-base-turkish-1.1 (Apache-2.0), pyannote segmentation 3.0 (MIT), WeSpeaker ResNet34 (Apache-2.0) · transformers.js, ONNX Runtime.</p>
     </div>`;
 
   $$('[data-k]').forEach((el) => {
@@ -1299,7 +1308,7 @@ async function renderSettings() {
       if (k === 'threshold') $('#thr-v').textContent = (+el.value).toFixed(2);
       if (k === 'profileThreshold') $('#pthr-v').textContent = (+el.value).toFixed(2);
       saveSettings();
-      if (k === 'asrModel') updateCacheStatus();
+      if (k === 'asrModel' || k === 'language') updateCacheStatus();
     };
     el.addEventListener(el.type === 'range' || el.type === 'password' ? 'input' : 'change', handler);
   });
@@ -1317,6 +1326,29 @@ async function renderSettings() {
       ? '✅ Seçili modeller indirildi — uygulama internetsiz çalışır.'
       : `Seçili modellerin ${st.missing.length} dosyası henüz indirilmemiş. İlk kayıtta otomatik indirilir; isterseniz şimdi Wi-Fi'deyken indirin.`;
     $('#dl-models').classList.toggle('hidden', st.ok);
+    // Seçili kurulumda kullanılmayan (ör. eski çok dilli) model dosyaları
+    try {
+      const c = await caches.open('transformers-cache');
+      const need = new Set(modelFiles(asrModelFor(settings.asrModel, settings.language), LOCAL_MODELS));
+      let bytes = 0; const unused = [];
+      for (const req of await c.keys()) {
+        if (need.has(req.url)) continue;
+        unused.push(req);
+        bytes += +((await c.match(req))?.headers.get('content-length')) || 0;
+      }
+      const rm = $('#rm-models');
+      if (rm) {
+        rm.classList.toggle('hidden', !unused.length);
+        rm.textContent = `Kullanılmayan modelleri sil (${(bytes / 1e6).toFixed(0)} MB)`;
+        rm.onclick = async () => {
+          if (!(await confirmBox('Kullanılmayan modeller silinsin mi?', `Seçili kurulumda kullanılmayan ${unused.length} model dosyası (${(bytes / 1e6).toFixed(0)} MB) silinecek. Kayıtlarınız etkilenmez; o modeli tekrar seçerseniz yeniden indirilir.`, 'Sil', true))) return;
+          for (const req of unused) await c.delete(req);
+          logEvent(`kullanılmayan modeller silindi: ${unused.length} dosya, ${(bytes / 1e6).toFixed(0)} MB`);
+          toast(`${(bytes / 1e6).toFixed(0)} MB yer açıldı`);
+          if (route().name === 'settings') renderSettings();
+        };
+      }
+    } catch { /* boş */ }
     try {
       const est = await navigator.storage.estimate();
       const persisted = await navigator.storage.persisted?.();
