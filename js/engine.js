@@ -24,6 +24,22 @@ export const MODELS = {
   },
 };
 
+/**
+ * Seçili kurulum için gereken model dosyalarının adresleri (transformers.js'in
+ * önbellek anahtarlarıyla birebir aynı). "Modelleri indir" düğmesi bunları belleğe
+ * yüklemeden doğrudan Cache Storage'a indirir.
+ */
+export function modelFiles(asrSize = 'base') {
+  const hf = (repo, f) => `https://huggingface.co/${repo}/resolve/main/${f}`;
+  const asr = (MODELS.asr[asrSize] || MODELS.asr.base).id;
+  return [
+    ...['config.json', 'preprocessor_config.json', 'onnx/model.onnx'].map((f) => hf(MODELS.segmentation, f)),
+    ...['config.json', 'preprocessor_config.json', 'onnx/model.onnx'].map((f) => hf(MODELS.embedding, f)),
+    ...['config.json', 'generation_config.json', 'preprocessor_config.json', 'tokenizer.json', 'tokenizer_config.json',
+      'onnx/encoder_model_quantized.onnx', 'onnx/decoder_model_merged_quantized.onnx'].map((f) => hf(asr, f)),
+  ];
+}
+
 // pyannote powerset sınıfları: 0 = sessizlik, 1-3 tek konuşmacı, 4-6 iki kişi aynı anda.
 const POWERSET = [[], [0], [1], [2], [0, 1], [0, 2], [1, 2]];
 
@@ -50,9 +66,13 @@ export class Engine {
    * @param {any} T transformers.js modülü
    * @param {{diarDevice?: string}} opt  tarayıcıda 'wasm', Node'da 'cpu'
    */
-  constructor(T, { diarDevice = 'wasm' } = {}) {
+  constructor(T, { diarDevice = 'wasm', lowMemory = true } = {}) {
     this.T = T;
     this.diarDevice = diarDevice;
+    // Telefonlarda bellek sınırı dar: ONNX graf optimizasyonu, model ağırlıklarının
+    // geçici kopyalarını oluşturup WebAssembly belleğini kalıcı olarak büyütüyor.
+    // Kapatınca tepe bellek ~150-190 MB düşüyor (metne çevirme ~%50 yavaşlıyor).
+    this.sessionOptions = lowMemory ? { graphOptimizationLevel: 'disabled' } : {};
     this.seg = null;
     this.emb = null;
     this.asr = null;
@@ -63,7 +83,7 @@ export class Engine {
 
   async loadDiarization(progress_callback) {
     const T = this.T;
-    const opts = { dtype: 'fp32', device: this.diarDevice, progress_callback };
+    const opts = { dtype: 'fp32', device: this.diarDevice, progress_callback, session_options: this.sessionOptions };
     if (!this.seg) {
       const [processor, model] = await Promise.all([
         T.AutoProcessor.from_pretrained(MODELS.segmentation, { progress_callback }),
@@ -88,8 +108,16 @@ export class Engine {
     const dtype = device === 'webgpu'
       ? { encoder_model: 'fp32', decoder_model_merged: 'q4' }
       : { encoder_model: 'q8', decoder_model_merged: 'q8' };
-    this.asr = await this.T.pipeline('automatic-speech-recognition', m.id, { device, dtype, progress_callback });
+    const session_options = device === 'webgpu' ? {} : this.sessionOptions;
+    this.asr = await this.T.pipeline('automatic-speech-recognition', m.id, { device, dtype, progress_callback, session_options });
     this.asrKey = key;
+  }
+
+  /** Modelleri bırak (işçi zaten kapatılacak ama erken temizlik zarar vermez). */
+  async dispose() {
+    for (const x of [this.seg?.model, this.emb?.model, this.asr]) { try { await x?.dispose?.(); } catch { /* yoksay */ } }
+    this.seg = this.emb = this.asr = null;
+    this.asrKey = null;
   }
 
   // ---------- konuşmacı ayırma ----------

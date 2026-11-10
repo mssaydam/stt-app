@@ -1,6 +1,7 @@
 // Konuşma Defteri — arayüz ve uygulama akışı.
 import { db, uid } from './db.js';
 import { ask, explainError, hasKey, transcriptText, fmtTime, SUMMARY_PROMPT, CLAUDE_MODELS } from './claude.js';
+import { modelFiles } from './engine.js';
 
 // ====================================================================
 // Yardımcılar
@@ -29,9 +30,11 @@ const ICON = {
 // ====================================================================
 // Ayarlar (yalnızca bu cihazda, localStorage)
 // ====================================================================
+export const APP_VERSION = '1.1.0';
 const DEFAULTS = {
+  v: 2,
   asrModel: 'base',          // tiny | base | small
-  device: 'auto',            // auto | wasm | webgpu
+  device: 'wasm',            // wasm (CPU) | webgpu (deneysel)
   language: 'turkish',
   threshold: 0.45,           // konuşmacı ayırma: yüksek → daha çok kişi
   profileThreshold: 0.5,     // kayıtlı kişiyi tanıma eşiği
@@ -40,9 +43,41 @@ const DEFAULTS = {
   claudeModel: 'claude-opus-5-5',
   effort: 'medium',
 };
-let settings = { ...DEFAULTS };
-try { settings = { ...DEFAULTS, ...JSON.parse(localStorage.getItem('kd-settings') || '{}') }; } catch { /* boş */ }
+let stored = {};
+try { stored = JSON.parse(localStorage.getItem('kd-settings') || '{}') || {}; } catch { /* boş */ }
+let settings = { ...DEFAULTS, ...stored };
 const saveSettings = () => { try { localStorage.setItem('kd-settings', JSON.stringify(settings)); } catch { /* boş */ } };
+// 1.0 → 1.1: "otomatik" işlemci iPhone'da deneysel WebGPU'yu seçip çökmeye yol açabiliyordu.
+if (Object.keys(stored).length && (stored.v || 1) < 2) {
+  settings.device = 'wasm';
+  settings.v = 2;
+  saveSettings();
+}
+
+// ====================================================================
+// Tanılama: hata günlüğü ve "kapanma izi"
+// iOS bir sayfayı bellek yetmediği için öldürdüğünde hiçbir hata yakalanamaz;
+// bu yüzden işlemin hangi aşamada olduğunu her adımda kalıcı olarak yazıyoruz.
+// ====================================================================
+const LOG_KEY = 'kd-log', CRUMB_KEY = 'kd-crumb';
+function logEvent(msg) {
+  try {
+    const log = JSON.parse(localStorage.getItem(LOG_KEY) || '[]');
+    log.push(`${new Date().toISOString().slice(5, 19).replace('T', ' ')} ${String(msg).slice(0, 400)}`);
+    localStorage.setItem(LOG_KEY, JSON.stringify(log.slice(-40)));
+  } catch { /* boş */ }
+}
+window.addEventListener('error', (e) => logEvent(`hata: ${e.message} @${(e.filename || '').split('/').pop()}:${e.lineno}`));
+window.addEventListener('unhandledrejection', (e) => logEvent(`söz hatası: ${e.reason?.message || e.reason}`));
+let lastCrumbWrite = 0;
+function writeCrumb(c, force = false) {
+  const now = Date.now();
+  if (!force && now - lastCrumbWrite < 1500) return;
+  lastCrumbWrite = now;
+  try { localStorage.setItem(CRUMB_KEY, JSON.stringify({ ...c, t: now })); } catch { /* boş */ }
+}
+const readCrumb = () => { try { return JSON.parse(localStorage.getItem(CRUMB_KEY) || 'null'); } catch { return null; } };
+const clearCrumb = () => { try { localStorage.removeItem(CRUMB_KEY); } catch { /* boş */ } };
 
 // ====================================================================
 // Durum
@@ -209,14 +244,27 @@ async function decodeTo16k(blob) {
 // ====================================================================
 // İşleme kuyruğu (Web Worker)
 // ====================================================================
-let worker = null;
-const listeners = new Set();
-function getWorker() {
-  if (worker) return worker;
-  worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-  worker.onmessage = (e) => listeners.forEach((fn) => fn(e.data));
-  worker.onerror = (e) => { console.error(e); toast('İşlemci hatası: ' + (e.message || 'bilinmiyor')); };
-  return worker;
+/**
+ * Tek bir işi yeni bir işçide çalıştırır ve iş bitince işçiyi KAPATIR.
+ * (WebAssembly belleği ancak işçi kapatılınca geri verilir.)
+ * @param {object} msg  işçiye gönderilecek mesaj
+ * @param {Transferable[]} transfer
+ * @param {(m:object)=>void} onEvent  ara mesajlar (progress, turn …)
+ * @param {string} doneType  işin bittiğini bildiren mesaj tipi
+ */
+function runInWorker(msg, transfer, onEvent, doneType) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+    const finish = (fn, v) => { try { w.terminate(); } catch { /* boş */ } fn(v); };
+    w.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === doneType) finish(resolve, m);
+      else if (m.type === 'error') { logEvent(`işçi hatası [${m.stage}]: ${m.message}`); finish(reject, Object.assign(new Error(m.message), { stage: m.stage })); }
+      else onEvent?.(m);
+    };
+    w.onerror = (e) => { logEvent(`işçi yüklenemedi: ${e.message || 'bilinmiyor'}`); finish(reject, new Error('İşlemci başlatılamadı: ' + (e.message || 'bilinmiyor'))); };
+    w.postMessage(msg, transfer || []);
+  });
 }
 
 const STAGES = {
@@ -248,58 +296,67 @@ async function pump() {
   const { id, over } = state.queue.shift();
   const rec = findRec(id);
   if (!rec) return pump();
+  const ws = workerSettings(over);
   state.job = { id, stage: 'decode', value: 0, detail: '' };
+  state.device = ws.device === 'webgpu' ? 'GPU' : 'CPU';
   rec.status = 'processing';
   rec.error = null;
   await saveRec(rec);
   refresh();
   await wake(true);
+  const crumb = { id, stage: 'decode', model: ws.asrModel, device: ws.device, dur: rec.duration };
+  writeCrumb(crumb, true);
+  const onProgress = (m) => {
+    if (m.type !== 'progress') return;
+    const changed = m.stage !== state.job.stage;
+    Object.assign(state.job, { stage: m.stage, value: m.value, detail: m.detail || '' });
+    crumb.stage = m.stage; crumb.value = Math.round(m.value * 100);
+    writeCrumb(crumb, changed);
+    updateProgressUI();
+  };
   try {
     const a = await db.get('audio', id);
     if (!a) throw new Error('Bu kaydın sesi silinmiş; yeniden işlenemez.');
-    const audio = await decodeTo16k(a.blob);
+    let audio = await decodeTo16k(a.blob);
     rec.duration = audio.length / 16000;
-    const w = getWorker();
-    const result = await new Promise((resolve, reject) => {
-      const fn = (m) => {
-        if (m.type === 'progress') {
-          Object.assign(state.job, { stage: m.stage, value: m.value, detail: m.detail || '' });
-          if (m.device) state.device = m.device;
-          updateProgressUI();
-        } else if (m.type === 'diarized' && m.id === id) {
-          const old = rec.speakers || [];
-          rec.speakers = m.speakers.map((s, i) => ({
-            ...s,
-            // yeniden işlemede, profil eşleşmesi yoksa eski adı aynı sıradaki konuşmacıya koru
-            name: s.profileId ? null : (over.keepNames ? old[i]?.name || null : null),
-          }));
-          rec.turns = [];
-          if (isViewing(id)) renderDetailParts(rec);
-        } else if (m.type === 'turn' && m.id === id) {
-          rec.turns.push(m.turn);
-          if (isViewing(id)) appendTurnLive(rec, m.turn);
-        } else if (m.type === 'done' && m.id === id) {
-          listeners.delete(fn); resolve(m);
-        } else if (m.type === 'error' && (m.id === id || !m.id)) {
-          listeners.delete(fn); reject(new Error(m.message));
-        }
-      };
-      listeners.add(fn);
-      w.postMessage({ type: 'process', id, audio, settings: workerSettings(over), profiles: state.profiles }, [audio.buffer]);
-    });
+    crumb.dur = Math.round(rec.duration);
+
+    // 1. aşama: konuşmacı ayırma (ayrı işçi, sonra kapatılır)
+    const d = await runInWorker({ type: 'diarize', id, audio, settings: ws, profiles: state.profiles }, [audio.buffer], onProgress, 'diarized');
+    audio = d.audio; // ses geri geldi
+    const old = rec.speakers || [];
+    rec.speakers = d.speakers.map((s, i) => ({
+      ...s,
+      // yeniden işlemede, profil eşleşmesi yoksa eski adı aynı sıradaki konuşmacıya koru
+      name: s.profileId ? null : (over.keepNames ? old[i]?.name || null : null),
+    }));
+    rec.turns = [];
+    await saveRec(rec);
+    if (isViewing(id)) renderDetailParts(rec);
+
+    // 2. aşama: metne çevirme (yeni işçi, sonra kapatılır)
+    const result = await runInWorker({ type: 'transcribe', id, audio, segments: d.segments, settings: ws }, [audio.buffer], (m) => {
+      if (m.type === 'turn') {
+        rec.turns.push(m.turn);
+        if (isViewing(id)) appendTurnLive(rec, m.turn);
+      } else onProgress(m);
+    }, 'done');
     rec.turns = result.turns;
     rec.status = 'done';
-    rec.processedWith = { asrModel: over.asrModel || settings.asrModel, device: result.device, at: Date.now() };
+    rec.crashes = 0;
+    rec.processedWith = { asrModel: ws.asrModel, device: result.device, at: Date.now(), version: APP_VERSION };
     await saveRec(rec);
     if (!settings.keepAudio) await db.del('audio', id);
     toast(`“${rec.title}” hazır`);
   } catch (err) {
     console.error(err);
+    logEvent(`işleme hatası [${state.job?.stage}]: ${err.message || err}`);
     rec.status = 'error';
-    rec.error = String(err.message || err);
+    rec.error = `${STAGES[state.job?.stage] || state.job?.stage || ''} aşamasında hata: ${err.message || err}`;
     await saveRec(rec);
-    toast('İşleme hatası: ' + rec.error, 5000);
+    toast('İşleme hatası: ' + (err.message || err), 5000);
   } finally {
+    clearCrumb();
     state.job = null;
     await wake(false);
     refresh();
@@ -690,10 +747,18 @@ function renderStatus(r) {
   } else if (r.status === 'queued') {
     el.innerHTML = '<div class="card"><b>Sırada bekliyor…</b></div>';
   } else if (r.status === 'error' || r.status === 'processing') {
-    el.innerHTML = `<div class="card"><b style="color:var(--danger)">${r.status === 'error' ? 'İşleme başarısız' : 'İşleme yarıda kaldı'}</b>
+    const crashed = r.status === 'processing';
+    const light = r.crash?.model === 'tiny' ? null : 'tiny';
+    el.innerHTML = `<div class="card"><b style="color:var(--danger)">${crashed ? 'İşleme yarıda kaldı' : 'İşleme başarısız'}</b>
       <p class="small muted">${esc(r.error || 'Uygulama işlem sırasında kapanmış olabilir.')}</p>
-      <button class="btn primary" id="retry">Tekrar dene</button></div>`;
-    $('#retry').onclick = () => enqueue(r.id);
+      ${crashed ? `<p class="small muted">Telefonun bu sayfaya ayırdığı bellek yetmemiş olabilir. Diğer uygulamaları kapatıp tekrar deneyin${light ? ' ya da daha hafif modeli seçin' : ''}.</p>` : ''}
+      <div class="btn-row">
+        <button class="btn primary" id="retry">Tekrar dene</button>
+        ${light ? '<button class="btn" id="retry-light">Hafif modelle dene (tiny)</button>' : ''}
+      </div>
+      <p class="small muted" style="margin:8px 0 0">Sorun sürerse: Ayarlar → Tanılama → “Raporu kopyala” ve bana iletin.</p></div>`;
+    $('#retry').onclick = () => enqueue(r.id, { keepNames: true });
+    $('#retry-light')?.addEventListener('click', () => enqueue(r.id, { asrModel: 'tiny', keepNames: true }));
   } else el.innerHTML = '';
 }
 
@@ -707,7 +772,7 @@ function renderDetailParts(r) {
   const tr = $('#d-transcript');
   if (tr) {
     tr.innerHTML = (r.turns || []).map((t, i) => turnHtml(r, t, i)).join('')
-      || `<p class="muted small">${state.job?.id === r.id || r.status === 'queued' ? 'Metin hazırlanıyor…' : 'Bu kayıtta konuşma bulunamadı.'}</p>`;
+      || `<p class="muted small">${state.job?.id === r.id || r.status === 'queued' ? 'Metin hazırlanıyor…' : r.status === 'done' ? 'Bu kayıtta konuşma bulunamadı.' : 'Henüz metin yok.'}</p>`;
     $$('.turn', tr).forEach((el) => el.addEventListener('click', () => turnMenu(r, +el.dataset.i)));
     const wc = $('#d-wc');
     if (wc) wc.textContent = r.turns?.length ? `${words(r.turns.map((t) => t.text).join(' '))} kelime` : '';
@@ -742,7 +807,7 @@ async function moreMenu(r) {
     const m = await menu('Konuşma tanıma modeli', [
       { label: 'Hızlı (tiny, ~41 MB)', value: 'tiny' },
       { label: 'Dengeli (base, ~77 MB)', value: 'base' },
-      { label: 'En doğru (small, ~250 MB, yavaş)', value: 'small' },
+      { label: 'En doğru (small, ~250 MB) – telefonda belleğe sığmayabilir', value: 'small' },
     ]);
     if (!m) return;
     if (r.turns?.length && !(await confirmBox('Yeniden işlensin mi?', 'Mevcut metin ve metin üzerindeki düzeltmeleriniz yenisiyle değiştirilecek (özet ve sorular korunur).', 'Yeniden işle'))) return;
@@ -1028,16 +1093,67 @@ function renderPeople() {
 }
 
 // ---------------- Ayarlar ----------------
-async function modelCacheStatus() {
+/** Seçili model kurulumunun tüm dosyaları önbellekte mi? → { ok, missing[] } */
+async function modelCacheStatus(size = settings.asrModel) {
   try {
     const c = await caches.open('transformers-cache');
-    const keys = (await c.keys()).map((k) => k.url);
-    const has = (id) => keys.some((u) => u.includes(id + '/') && u.endsWith('.onnx'));
-    return {
-      diar: has('pyannote-segmentation-3.0') && has('wespeaker-voxceleb-resnet34-LM'),
-      tiny: has('whisper-tiny'), base: has('whisper-base'), small: has('whisper-small'),
-    };
-  } catch { return {}; }
+    const have = new Set((await c.keys()).map((k) => k.url));
+    const missing = modelFiles(size).filter((u) => !have.has(u));
+    return { ok: missing.length === 0, missing };
+  } catch (e) { return { ok: false, missing: [], error: String(e) }; }
+}
+
+/**
+ * Model dosyalarını belleğe YÜKLEMEDEN, akış hâlinde doğrudan önbelleğe indirir.
+ * (Eski sürüm indirirken modelleri de çalıştırıyordu; telefonda belleği zorluyordu.)
+ */
+async function downloadModels(size, onProgress) {
+  const cache = await caches.open('transformers-cache');
+  const { missing } = await modelCacheStatus(size);
+  let i = 0;
+  for (const url of missing) {
+    i++;
+    const name = url.split('/').pop();
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${name} indirilemedi (HTTP ${res.status})`);
+    const total = +res.headers.get('content-length') || 0;
+    let loaded = 0;
+    const report = () => onProgress({ file: i, files: missing.length, loaded, total, name });
+    let body;
+    if (res.body && typeof TransformStream !== 'undefined') {
+      body = res.body.pipeThrough(new TransformStream({
+        transform(chunk, ctl) { loaded += chunk.byteLength; report(); ctl.enqueue(chunk); },
+      }));
+    } else { body = await res.arrayBuffer(); loaded = body.byteLength; report(); }
+    await cache.put(url, new Response(body, { status: 200, headers: res.headers }));
+    logEvent(`indirildi: ${url.replace('https://huggingface.co/', '')} ${(total / 1e6).toFixed(1)} MB`);
+  }
+  return missing.length;
+}
+
+/** Tanılama raporu: kullanıcı kopyalayıp geliştiriciye iletebilir. Kişisel içerik yok. */
+async function diagnosticsText() {
+  const ua = navigator.userAgent;
+  const ios = (ua.match(/OS (\d+)[._](\d+)(?:[._](\d+))? like Mac OS X/) || []).slice(1).filter(Boolean).join('.');
+  const lines = [
+    `Konuşma Defteri ${APP_VERSION}`,
+    `Cihaz: ${/iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : navigator.platform}${ios ? ` · iOS ${ios}` : ''} · ekran ${screen.width}x${screen.height}@${devicePixelRatio}`,
+    `Tarayıcı: ${ua}`,
+    `Ana ekran uygulaması: ${standalone ? 'evet' : 'hayır'} · WebGPU: ${navigator.gpu ? 'var' : 'yok'} · çekirdek: ${navigator.hardwareConcurrency || '?'} · bellek: ${navigator.deviceMemory ? navigator.deviceMemory + ' GB' : 'bilinmiyor'}`,
+    `Ayarlar: model=${settings.asrModel} işlemci=${settings.device} dil=${settings.language} eşik=${settings.threshold}`,
+  ];
+  try {
+    const est = await navigator.storage.estimate();
+    lines.push(`Depolama: ${(est.usage / 1e6).toFixed(0)} MB kullanılıyor / ${(est.quota / 1e6).toFixed(0)} MB kota · kalıcı: ${await navigator.storage.persisted?.() ? 'evet' : 'hayır'}`);
+  } catch { /* boş */ }
+  const st = await modelCacheStatus();
+  lines.push(`Modeller (${settings.asrModel}): ${st.ok ? 'tamam' : `${st.missing.length} dosya eksik`}`);
+  const crashed = state.recs.filter((r) => r.crash).slice(0, 3);
+  for (const r of crashed) lines.push(`Kapanma: ${r.crashes || 1}x · aşama=${r.crash.stage} %${r.crash.value || 0} · model=${r.crash.model} · işlemci=${r.crash.device} · ses=${r.crash.dur || '?'} sn`);
+  let log = [];
+  try { log = JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); } catch { /* boş */ }
+  lines.push('— Günlük —', ...log.slice(-25));
+  return lines.join('\n');
 }
 
 async function renderSettings() {
@@ -1045,10 +1161,10 @@ async function renderSettings() {
   const sel = (name, opts) => `<select data-k="${name}">${opts.map(([v, l]) => `<option value="${v}" ${String(settings[name]) === String(v) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   view().innerHTML = `
     <div class="card"><h2>Konuşma tanıma (cihazda)</h2>
-      <label class="field"><span>Model</span>${sel('asrModel', [['tiny', 'Hızlı – tiny (~41 MB)'], ['base', 'Dengeli – base (~77 MB, önerilen)'], ['small', 'En doğru – small (~250 MB, yavaş)']])}
-        <small>Büyük model Türkçe'de belirgin şekilde daha doğrudur ama telefonda 3–4 kat yavaştır.</small></label>
+      <label class="field"><span>Model</span>${sel('asrModel', [['tiny', 'Hızlı – tiny (~41 MB)'], ['base', 'Dengeli – base (~77 MB, önerilen)'], ['small', 'En doğru – small (~250 MB) – iPhone\'da sığmayabilir']])}
+        <small>Büyük model Türkçe'de daha doğrudur ama daha yavaştır ve daha çok bellek ister. “small” işlem sırasında ~1,2 GB bellek kullanır; telefonlarda uygulamanın kapanmasına yol açabilir.</small></label>
       <label class="field"><span>Dil</span>${sel('language', [['turkish', 'Türkçe'], ['auto', 'Otomatik algıla'], ['english', 'İngilizce'], ['german', 'Almanca'], ['arabic', 'Arapça'], ['russian', 'Rusça'], ['french', 'Fransızca']])}</label>
-      <label class="field"><span>İşlemci</span>${sel('device', [['auto', 'Otomatik (WebGPU varsa onu kullan)'], ['wasm', 'CPU (WASM) – en uyumlu'], ['webgpu', 'GPU (WebGPU) – daha hızlı']])}
+      <label class="field"><span>İşlemci</span>${sel('device', [['wasm', 'CPU – en uyumlu (önerilen)'], ['webgpu', 'GPU (WebGPU) – deneysel']])}
         <small id="gpu-info"></small></label>
       <label class="field"><span>Konuşmacı ayırma hassasiyeti: <b id="thr-v">${settings.threshold.toFixed(2)}</b></span>
         <input type="range" min="0.25" max="0.7" step="0.05" data-k="threshold" value="${settings.threshold}">
@@ -1086,6 +1202,12 @@ async function renderSettings() {
       <input type="file" id="restore-file" accept="application/json,.json" hidden>
     </div>
 
+    <div class="card"><h2>Tanılama</h2>
+      <p class="small muted">Bir sorun olursa bu raporu kopyalayıp geliştiriciye iletin. Raporda kayıtlarınızın içeriği yok; yalnızca cihaz bilgisi, ayarlar ve hata kayıtları var.</p>
+      <pre id="diag" class="small" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;background:var(--surface-2);padding:8px;border-radius:8px">…</pre>
+      <div class="btn-row"><button class="btn" id="diag-copy">Raporu kopyala</button><button class="btn" id="diag-clear">Günlüğü temizle</button></div>
+    </div>
+
     <div class="card small muted"><h2>Gizlilik</h2>
       <p>• Ses kaydı, konuşmacı ayırma ve metne dönüştürme tamamen bu telefonda yapılır. Ses dosyası hiçbir zaman internete gönderilmez.</p>
       <p>• İnternet yalnızca iki şey için kullanılır: (1) ilk kullanımda yapay zekâ modellerini Hugging Face'ten <i>indirmek</i>; (2) siz istediğinizde konuşma <i>metnini</i> Claude'a göndermek.</p>
@@ -1106,16 +1228,18 @@ async function renderSettings() {
   });
 
   const gpu = !!navigator.gpu;
-  $('#gpu-info').textContent = gpu ? 'Bu cihazda WebGPU görünüyor.' : 'Bu tarayıcıda WebGPU yok; CPU kullanılacak.';
+  $('#gpu-info').textContent = gpu
+    ? 'Bu cihazda WebGPU var ama telefonda kapanmaya yol açabilir; sorun yaşarsanız CPU\'ya dönün.'
+    : 'Bu tarayıcıda WebGPU yok; CPU kullanılır.';
 
   const updateCacheStatus = async () => {
     const st = await modelCacheStatus();
     const el = $('#cache-st');
     if (!el) return;
-    const ok = st.diar && st[settings.asrModel];
-    el.innerHTML = ok
+    el.innerHTML = st.ok
       ? '✅ Seçili modeller indirildi — uygulama internetsiz çalışır.'
-      : `Seçili modeller henüz indirilmemiş (konuşmacı modeli: ${st.diar ? '✓' : '✗'}, ${esc(settings.asrModel)}: ${st[settings.asrModel] ? '✓' : '✗'}). İlk kayıtta otomatik indirilir; isterseniz şimdi Wi-Fi'deyken indirin.`;
+      : `Seçili modellerin ${st.missing.length} dosyası henüz indirilmemiş. İlk kayıtta otomatik indirilir; isterseniz şimdi Wi-Fi'deyken indirin.`;
+    $('#dl-models').classList.toggle('hidden', st.ok);
     try {
       const est = await navigator.storage.estimate();
       const persisted = await navigator.storage.persisted?.();
@@ -1125,25 +1249,27 @@ async function renderSettings() {
   updateCacheStatus();
 
   $('#dl-models').onclick = async () => {
-    if (state.job) { toast('Şu an bir kayıt işleniyor; bitince tekrar deneyin.'); return; }
     navigator.storage?.persist?.();
     const prog = $('#dl-prog'); prog.classList.remove('hidden');
     const btn = $('#dl-models'); btn.disabled = true;
-    const w = getWorker();
     try {
-      await new Promise((resolve, reject) => {
-        const fn = (m) => {
-          if (m.type === 'progress') { const i = $('#dl-prog i'); if (i) i.style.width = `${Math.round(m.value * 100)}%`; btn.textContent = `${STAGES[m.stage] || ''} ${m.detail || ''}`; }
-          else if (m.type === 'ready') { listeners.delete(fn); resolve(m); }
-          else if (m.type === 'error') { listeners.delete(fn); reject(new Error(m.message)); }
-        };
-        listeners.add(fn);
-        w.postMessage({ type: 'warmup', settings: workerSettings() });
+      await downloadModels(settings.asrModel, (p) => {
+        const i = $('#dl-prog i');
+        if (i) i.style.width = `${p.total ? Math.round(p.loaded / p.total * 100) : 0}%`;
+        btn.textContent = `Dosya ${p.file}/${p.files} · ${(p.loaded / 1e6).toFixed(0)}${p.total ? ` / ${(p.total / 1e6).toFixed(0)}` : ''} MB`;
       });
-      toast('Modeller hazır');
-    } catch (err) { toast('İndirme hatası: ' + err.message, 5000); }
+      toast('Modeller indirildi');
+    } catch (err) { logEvent('indirme hatası: ' + err.message); toast('İndirme hatası: ' + err.message, 5000); }
     if (route().name === 'settings') renderSettings();
   };
+
+  diagnosticsText().then((t) => { const el = $('#diag'); if (el) el.textContent = t; });
+  $('#diag-copy').onclick = async () => {
+    const t = await diagnosticsText();
+    try { await navigator.clipboard.writeText(t); toast('Rapor panoya kopyalandı'); }
+    catch { await shareText('konusma-defteri-tanilama.txt', t); }
+  };
+  $('#diag-clear').onclick = () => { try { localStorage.removeItem(LOG_KEY); } catch { /* boş */ } renderSettings(); };
 
   $('#test-key').onclick = async () => {
     if (!hasKey(settings)) { toast('Önce API anahtarını girin.'); return; }
@@ -1188,8 +1314,21 @@ async function renderSettings() {
 // ====================================================================
 async function init() {
   await loadAll();
-  // Uygulama işleme sırasında kapandıysa yarım kalanları işaretle
-  for (const r of state.recs) if (r.status === 'processing' || r.status === 'queued') { r.status = 'processing'; r.error = 'Uygulama işlem sırasında kapandı. Tekrar deneyin.'; await saveRec(r); }
+  // Uygulama işleme sırasında kapandıysa (iOS sayfayı bellek yüzünden öldürdüyse)
+  // yarım kalanları işaretle ve kapanma anındaki aşamayı göster.
+  const crumb = readCrumb();
+  for (const r of state.recs) {
+    if (r.status !== 'processing' && r.status !== 'queued') continue;
+    r.status = 'processing';
+    if (crumb && crumb.id === r.id) {
+      r.crash = crumb;
+      r.crashes = (r.crashes || 0) + 1;
+      r.error = `Uygulama “${STAGES[crumb.stage] || crumb.stage}” aşamasında${crumb.value ? ` (%${crumb.value})` : ''} kapandı. Model: ${crumb.model}, işlemci: ${crumb.device === 'webgpu' ? 'GPU' : 'CPU'}.`;
+      logEvent(`KAPANMA: ${r.error} süre=${crumb.dur}s`);
+    } else r.error = 'Uygulama işlem sırasında kapandı.';
+    await saveRec(r);
+  }
+  clearCrumb();
 
   $('#fab').addEventListener('click', startRecording);
   $('#back').addEventListener('click', () => { if (history.length > 1) history.back(); else location.hash = '#/'; });

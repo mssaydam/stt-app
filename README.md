@@ -28,44 +28,43 @@ konuşmanın *metnini* Claude'a (varsayılan: Claude Opus 5.5) gönderip özet �
 
 ## iPhone'a kurulum
 
-Uygulama statik bir web sitesidir (sunucu kodu yok). HTTPS üzerinden yayınlanması yeterlidir;
-veriler sitede değil, her kullanıcının kendi telefonunda saklanır.
-
-### Seçenek A — Netlify Drop (ücretsiz, en kolay, Windows'tan 1 dakika)
-1. <https://app.netlify.com/drop> adresini açın (ücretsiz hesap).
-2. Bu depodaki **`konusma`** klasörünü sayfaya sürükleyip bırakın.
-3. Verilen `https://….netlify.app` adresini iPhone'da **Safari** ile açın.
-
-(Cloudflare Pages → "Upload assets" de aynı şekilde çalışır.)
-
-### Seçenek B — GitHub Pages
-Bu depo **özel (private)**; GitHub'ın ücretsiz planında özel depolardan Pages yayını yapılamaz
-(GitHub Pro gerekir). Pro'nuz varsa:
-1. Depo → Settings → Pages → Source: **GitHub Actions**.
-2. Değişiklikleri `main` dalına birleştirin; `.github/workflows/konusma-pages.yml` otomatik yayınlar.
-3. Adres: `https://<kullanıcı>.github.io/dresscode/`.
+Uygulama statik bir web sitesidir (sunucu kodu yok); bu depo GitHub Pages ile yayınlanır:
+**<https://mssaydam.github.io/stt-app/>**. Veriler sitede değil, her kullanıcının kendi telefonunda saklanır.
+`main` dalına yapılan her gönderim `.github/workflows/pages.yml` ile otomatik yayınlanır.
 
 ### Telefonda
-1. Safari'de adresi açın → **Paylaş → Ana Ekrana Ekle**. (Önemli: Ana ekrana eklenen
+1. Safari'de adresi açın → **Paylaş → Ana Ekrana Ekle** → uygulamayı ana ekrandaki simgeden açın. (Önemli: Ana ekrana eklenen
    uygulamaların verilerini iOS kendiliğinden silmez ve uygulama internetsiz açılır.)
-2. Ayarlar → **"Seçili modelleri şimdi indir"** (Wi-Fi'de, bir kerelik).
+2. Ana ekran uygulamasının içinde Ayarlar → **"Seçili modelleri şimdi indir"** (Wi-Fi'de, bir kerelik).
+   iOS ana ekran uygulamasının depolamasını Safari'den ayrı tutar; Safari sekmesinde indirilenler orada görünmez.
 3. İsterseniz Ayarlar → **Claude API** bölümüne anahtarınızı girin
    (<https://platform.claude.com/settings/keys>; orada aylık harcama sınırı koyabilirsiniz).
 4. Kayıt sırasında ekranı açık tutun (uygulama ekranı kendisi açık tutmaya çalışır).
    iOS, ekran kilitlenince veya başka uygulamaya geçince web uygulamalarının mikrofonunu durdurur.
 
-## Model seçimi ve hız
+## Model seçimi, hız ve bellek
 
-| Model | İndirme | Türkçe doğruluk | Göreli hız |
-|---|---|---|---|
-| tiny | ~41 MB | zayıf | en hızlı |
-| base (varsayılan) | ~77 MB | orta | orta |
-| small | ~250 MB | iyi | base'in ~2–3 katı süre |
+| Model | İndirme | Türkçe doğruluk | İşlem sırasında tepe bellek* | Süre* |
+|---|---|---|---|---|
+| tiny | ~41 MB | zayıf | ~560 MB | 47 sn |
+| base (varsayılan) | ~77 MB | orta | ~670 MB | 84 sn |
+| small | ~250 MB | iyi | ~1,2 GB — **iPhone'da sığmayabilir** | 142 sn |
 
-Ölçülen: masaüstü Chromium'da (WASM, tek iş parçacığı) 80 sn'lik 3 kişilik test sesi tiny ile
-~40 sn'de işlendi. **iPhone'da hız henüz ölçülmedi**; telefonda daha yavaş olması beklenir.
+\* Masaüstü Chromium (CPU/WASM, tek iş parçacığı), 80 sn'lik 3 kişilik test sesi. **iPhone'da ölçülmedi**;
+iOS bir web sayfasına sınırlı bellek verir ve aşılırsa sayfayı kapatıp yeniden yükler
+("Bu web sayfasında bir sorun oluştu" mesajı).
 
-- iOS 26 ve sonrası Safari'de WebGPU varsa "İşlemci: Otomatik" onu kullanır ve belirgin şekilde hızlanır.
+Belleği düşük tutmak için (1.1 sürümü):
+- Konuşmacı ayırma ve metne çevirme **ayrı işçilerde** çalışır; biri bitince kapatılır ve belleği geri verilir.
+- WebGPU'suz küçük ONNX Runtime çekirdeği (11 MB) kullanılır ve graf optimizasyonu kapalıdır
+  (tepe bellek ~150–190 MB düşük; karşılığında metne çevirme ~%50 daha yavaş).
+- "Modelleri indir" düğmesi dosyaları belleğe yüklemeden doğrudan önbelleğe indirir.
+- İşlemci varsayılanı **CPU**'dur. GPU (WebGPU) seçeneği deneyseldir; iPhone'da kapanmaya yol açabilir.
+
+Uygulama işlem sırasında kapanırsa, tekrar açıldığında hangi aşamada kapandığını gösterir ve
+"Hafif modelle dene (tiny)" önerir. Ayarlar → **Tanılama → Raporu kopyala** ile cihaz/hata bilgisi
+(kayıt içeriği olmadan) paylaşılabilir.
+
 - Kayıt ekranında **konuşmacı sayısını** seçmek, otomatik algılamadan daha güvenilir sonuç verir.
 - Yanlış ayrılan kişiler için: konuşmacıya dokun → "Başka bir konuşmacıyla birleştir";
   tek bir cümle için: cümleye dokun → "Konuşmacıyı değiştir".
@@ -75,17 +74,17 @@ Bu depo **özel (private)**; GitHub'ın ücretsiz planında özel depolardan Pag
 ## Teknik yapı
 
 ```
-konusma/
+./
 ├── index.html              arayüz iskeleti + CSP
 ├── css/app.css
 ├── js/app.js               ekranlar, kayıt, işleme kuyruğu, dışa aktarma, Claude düğmeleri
 ├── js/engine.js            konuşmacı ayırma + kümeleme + tanıma + Whisper (Node'da da çalışır)
-├── js/worker.js            modelleri Web Worker'da çalıştırır (arayüz donmaz)
+├── js/worker.js            modelleri Web Worker'da çalıştırır (her aşama ayrı işçi; arayüz donmaz)
 ├── js/claude.js            Anthropic SDK ile özet / soru-cevap (akışlı, prompt caching)
 ├── js/db.js                IndexedDB (kayıtlar, sesler, kişi profilleri, ara kayıtlar)
 ├── sw.js                   service worker (çevrimdışı açılış)
 ├── manifest.webmanifest, icons/
-└── vendor/                 transformers.js 3.8.1, ONNX Runtime Web WASM, @anthropic-ai/sdk 1.1.0
+└── vendor/                 transformers.js 3.8.1, ONNX Runtime Web 1.22 WASM (CPU + WebGPU çekirdekleri), @anthropic-ai/sdk 1.1.0
 ```
 
 İşleme hattı (tamamen cihazda):

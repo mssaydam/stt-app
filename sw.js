@@ -2,7 +2,7 @@
 // Model dosyaları transformers.js tarafından ayrıca "transformers-cache" içinde saklanır.
 // Claude API ve Hugging Face isteklerine dokunulmaz.
 
-const VERSION = 'kd-v1';
+const VERSION = 'kd-v2';
 const APP_FILES = [
   './',
   './index.html',
@@ -14,8 +14,9 @@ const APP_FILES = [
   './js/worker.js',
   './vendor/transformers.min.js',
   './vendor/anthropic.min.mjs',
-  './vendor/ort-wasm-simd-threaded.jsep.mjs',
-  './vendor/ort-wasm-simd-threaded.jsep.wasm',
+  './vendor/ort-wasm-simd-threaded.mjs',
+  './vendor/ort-wasm-simd-threaded.wasm',
+  // WebGPU (deneysel) çekirdeği (.jsep, 22 MB) yalnızca kullanılırsa çalışma anında önbelleğe alınır.
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
