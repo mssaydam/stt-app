@@ -41,8 +41,26 @@ Uygulama statik bir web sitesidir (sunucu kodu yok); bu depo GitHub Pages ile ya
    iOS ana ekran uygulamasının depolamasını Safari'den ayrı tutar; Safari sekmesinde indirilenler orada görünmez.
 3. İsterseniz Ayarlar → **Claude API** bölümüne anahtarınızı girin
    (<https://platform.claude.com/settings/keys>; orada aylık harcama sınırı koyabilirsiniz).
-4. Kayıt sırasında ekranı açık tutun (uygulama ekranı kendisi açık tutmaya çalışır).
-   iOS, ekran kilitlenince veya başka uygulamaya geçince web uygulamalarının mikrofonunu durdurur.
+4. Kayıt sırasında ekranı açık tutun (uygulama ekranı kendisi açık tutar).
+
+### Kayıt ve ekran kilidi
+
+iOS, ekran kilitlendiğinde ya da başka uygulamaya geçildiğinde **web uygulamalarının** mikrofonunu kapatır;
+bu bir iOS kuralıdır ve web uygulaması tarafından aşılamaz (yerel uygulamalar "arka plan ses" izniyle aşar).
+Bu yüzden (1.3 sürümü):
+
+- **Yanlışlıkla durdurmaya karşı:** kayıt ekranındaki Bitir / Duraklat / İptal düğmeleri yalnızca
+  **basılı tutunca** çalışır (çevrelerinde dolan halka); kısa dokunuşlar kaydı etkilemez.
+- **Ekranı açık tutma:** Screen Wake Lock API; çalışmazsa sessiz, görünmez küçük bir video yedeği.
+- **Kesintiye karşı:** uygulama arka plana geçtiği anda o ana kadarki kayıt saklanır. Dönüşte mikrofon
+  hâlâ açıksa kayıt sürer ve kaydedilemeyen süre için uyarı gösterilir; mikrofon kapanmışsa kaydedilen
+  kısım işlenir ve bu açıkça söylenir. Uygulama tamamen kapanmışsa açılışta "yarım kalmış kayıt" kurtarılır.
+- Kayıt göstergesi her zaman görünürdür; iOS da mikrofon kullanılırken turuncu göstergeyi yakar.
+- **Ekran kapalıyken kayıt için:** iPhone'un **Ses Notları** uygulamasıyla kaydedin (kilitli ekranda çalışır)
+  → kayıt → ••• → **Dosyalar'a Kaydet** → bu uygulamada **↑ İçe aktar**. (Ses Notları'nın iCloud eşitlemesi
+  açıksa kayıt iCloud'a yüklenir; istemiyorsanız Ayarlar → [adınız] → iCloud → Ses Notları'nı kapatın.)
+- **Dokunmatiği tamamen kilitlemek için:** Ayarlar → Erişilebilirlik → **Yönlendirmeli Erişim**; kayıt
+  ekranında yan tuşa üç kez basıp "Dokunma"yı kapatın.
 
 ## Model seçimi, hız ve bellek
 

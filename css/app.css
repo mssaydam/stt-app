@@ -211,6 +211,19 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .round.sec { width: 56px; height: 56px; background: var(--surface-2); color: var(--text); }
 .round svg { width: 24px; height: 24px; }
 .recorder .privacy { font-size: 13px; color: var(--muted); text-align: center; max-width: 320px; }
+/* uzun basmada iOS metin seçimi / büyüteç / menü açmasın */
+.recorder { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.round.hold { position: relative; touch-action: none; }
+/* basılı tutarken dolan ilerleme halkası (--p: 0…1) */
+.round.hold::after {
+  content: ''; position: absolute; inset: -7px; border-radius: 50%; pointer-events: none;
+  background: conic-gradient(var(--rec) calc(var(--p, 0) * 360deg), transparent 0);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+}
+.lockline { font-size: 13px; color: var(--muted); text-align: center; max-width: 320px; }
+.rec-hint { min-height: 20px; font-size: 14px; font-weight: 650; color: var(--accent); text-align: center; }
+.recorder .banner { max-width: 340px; text-align: center; margin: 0; }
 
 /* ---------- sayfa / diyalog ---------- */
 .sheet-bg { position: fixed; inset: 0; z-index: 60; background: rgba(0, 0, 0, .4); display: flex; align-items: flex-end; justify-content: center; }

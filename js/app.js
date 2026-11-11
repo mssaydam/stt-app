@@ -30,7 +30,7 @@ const ICON = {
 // ====================================================================
 // Ayarlar (yalnızca bu cihazda, localStorage)
 // ====================================================================
-export const APP_VERSION = '1.2.0';
+export const APP_VERSION = '1.3.0';
 const DEFAULTS = {
   v: 3,
   asrModel: 'base-tr',       // base-tr (Türkçe) | tiny | base | small
@@ -210,15 +210,46 @@ function md(src) {
 // ====================================================================
 // Ekranı açık tutma (kayıt ve işleme sırasında)
 // ====================================================================
-let wakeLock = null, wakeWanted = 0;
+// iOS kilitli ekranda web uygulamalarının mikrofonunu kapattığı için kayıt sırasında
+// ekranın kendiliğinden kilitlenmemesi önemli. Önce Screen Wake Lock API; desteklenmiyorsa
+// ya da reddedilirse (bazı iOS sürümlerinde ana ekran uygulamalarında çalışmıyordu)
+// sessiz, görünmez, döngüdeki küçük bir video ile ekran açık tutulur.
+let wakeLock = null, wakeWanted = 0, wakeVideo = null;
+state.wakeMode = 'yok';
+async function wakeVideoOn(on) {
+  if (on) {
+    if (!wakeVideo) {
+      wakeVideo = document.createElement('video');
+      wakeVideo.setAttribute('playsinline', '');
+      wakeVideo.setAttribute('aria-hidden', 'true');
+      wakeVideo.muted = true;
+      wakeVideo.loop = true;
+      wakeVideo.src = new URL('../vendor/keepawake.mp4', import.meta.url).href;
+      wakeVideo.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0.01;pointer-events:none';
+      document.body.append(wakeVideo);
+    }
+    try { await wakeVideo.play(); return true; } catch { return false; }
+  }
+  wakeVideo?.pause();
+  return false;
+}
 async function wake(on) {
   wakeWanted = Math.max(0, wakeWanted + (on ? 1 : -1));
-  try {
-    if (wakeWanted && !wakeLock && 'wakeLock' in navigator) {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeLock.addEventListener('release', () => { wakeLock = null; });
-    } else if (!wakeWanted && wakeLock) { await wakeLock.release(); wakeLock = null; }
-  } catch { /* desteklenmiyor */ }
+  if (wakeWanted) {
+    if (!wakeLock && 'wakeLock' in navigator) {
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+        state.wakeMode = 'wakeLock';
+      } catch (e) { logEvent(`ekran açık tutma (wakeLock) reddedildi: ${e?.message || e}`); }
+    }
+    if (!wakeLock) state.wakeMode = (await wakeVideoOn(true)) ? 'video' : 'yok';
+  } else {
+    try { await wakeLock?.release(); } catch { /* boş */ }
+    wakeLock = null;
+    await wakeVideoOn(false);
+    state.wakeMode = 'yok';
+  }
 }
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && wakeWanted) { wakeWanted--; wake(true); } });
 
@@ -327,6 +358,9 @@ async function pump() {
     let audio = await decodeTo16k(a.blob);
     rec.duration = audio.length / 16000;
     crumb.dur = Math.round(rec.duration);
+    // Ses dosyası, kayıt ekranındaki süreden belirgin şekilde kısaysa (ör. iOS'taki kayıt hatası) not et.
+    rec.truncated = !!(rec.recordedSec && rec.recordedSec - rec.duration > 5 && rec.duration < rec.recordedSec * 0.8);
+    if (rec.truncated) logEvent(`UYARI: kayıt ${fmtTime(rec.recordedSec)} sürdü ama ses dosyası ${fmtTime(rec.duration)}`);
 
     // 1. aşama: konuşmacı ayırma (ayrı işçi, sonra kapatılır)
     const d = await runInWorker({ type: 'diarize', id, audio, settings: ws, profiles: state.profiles }, [audio.buffer], onProgress, 'diarized');
@@ -382,7 +416,117 @@ function jobLabel() {
 // ====================================================================
 // Kayıt
 // ====================================================================
-const rec = { mr: null, stream: null, chunks: [], startedAt: 0, elapsed: 0, lastTick: 0, paused: false, ac: null, raf: 0, timer: 0, draftId: null, numSpeakers: 0 };
+const rec = {
+  mr: null, stream: null, chunks: [], startedAt: 0, elapsed: 0, lastTick: 0, paused: false, ac: null, raf: 0, timer: 0,
+  draftId: null, numSpeakers: 0, stopping: false, hiddenAt: 0, lostSec: 0, onVis: null,
+};
+
+/** Kayıt sürerken eldeki parçaları hemen (çökmeye/kapanmaya karşı) sakla. */
+function saveDraftNow() {
+  if (!rec.mr || rec.stopping) return Promise.resolve();
+  return db.put('drafts', { id: rec.draftId, chunks: rec.chunks.slice(), mime: rec.mr.mimeType, startedAt: rec.startedAt, elapsed: rec.elapsed }).catch(() => {});
+}
+
+/**
+ * iOS, ekran kilitlendiğinde ya da başka uygulamaya geçildiğinde web uygulamalarının
+ * mikrofonunu kapatır. Arka plana geçerken kaydı hemen saklıyoruz; dönüşte mikrofon
+ * kapanmışsa kaydı bitirip kullanıcıya açıkça söylüyoruz.
+ */
+function onRecordingVisibility() {
+  if (!rec.mr || rec.stopping) return;
+  if (document.visibilityState === 'hidden') {
+    rec.hiddenAt = performance.now();
+    logEvent('kayıt: uygulama arka plana geçti / ekran kilitlendi');
+    try { if (rec.mr.state === 'recording') rec.mr.requestData(); } catch { /* boş */ }
+    saveDraftNow();
+    return;
+  }
+  const gap = rec.hiddenAt ? (performance.now() - rec.hiddenAt) / 1000 : 0;
+  rec.hiddenAt = 0;
+  rec.lastTick = performance.now(); // arka planda geçen süreyi saate ekleme
+  const track = rec.stream?.getAudioTracks()[0];
+  if (!track || track.readyState === 'ended' || rec.mr.state === 'inactive') {
+    recordingInterrupted('arka planda mikrofon kapandı');
+    return;
+  }
+  if (gap >= 2) {
+    rec.lostSec += gap;
+    logEvent(`kayıt: ${Math.round(gap)} sn arka planda geçti, kayıt sürüyor`);
+    recWarn(`Ekran kilitlendiği ya da uygulamadan çıkıldığı için yaklaşık ${fmtTime(gap)} kaydedilmemiş olabilir. Kayıt devam ediyor.`);
+  }
+}
+
+async function recordingInterrupted(reason) {
+  if (!rec.mr || rec.stopping) return;
+  logEvent(`kayıt kesildi: ${reason}`);
+  const had = rec.elapsed;
+  await stopRecording(true);
+  await sheet(`<h3>Kayıt durdu</h3>
+    <p>iPhone, ekran kilitlendiğinde ya da başka uygulamaya geçildiğinde web uygulamalarının mikrofonunu kapatır.
+    <b>O ana kadarki ${fmtTime(had)} kaydedildi</b> ve işleniyor.</p>
+    <p class="small muted">Ekran kapalıyken kayıt için iPhone'un Ses Notları uygulamasıyla kaydedip dosyayı buraya aktarabilirsiniz.</p>
+    <div class="btn-row"><button class="btn" data-a="help">Nasıl?</button><button class="btn" data-a="ok">Tamam</button><button class="btn primary" data-a="new">Yeni kayıt</button></div>`,
+  (el, close) => {
+    $('[data-a=ok]', el).onclick = () => close();
+    $('[data-a=help]', el).onclick = () => { close(); showRecordingHelp(); };
+    $('[data-a=new]', el).onclick = () => { close(); startRecording(); };
+  });
+}
+
+function recWarn(msg) {
+  const el = $('#rec-warn');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+/**
+ * Yanlışlıkla dokunmaya karşı: düğme ancak `ms` boyunca basılı tutulunca çalışır.
+ * Basılı tutarken düğmenin çevresinde ilerleme halkası dolar; kısa dokunuşta ipucu gösterilir.
+ */
+function holdToActivate(btn, ms, onFire, hint) {
+  let start = 0, raf = 0;
+  const reset = () => { cancelAnimationFrame(raf); btn.style.setProperty('--p', 0); start = 0; };
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    start = performance.now();
+    const step = () => {
+      if (!start) return;
+      const p = Math.min(1, (performance.now() - start) / ms);
+      btn.style.setProperty('--p', p);
+      if (p >= 1) { reset(); navigator.vibrate?.(30); onFire(); } else raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+  });
+  const cancel = () => {
+    if (!start) return;
+    const held = performance.now() - start;
+    reset();
+    if (held < ms) {
+      const h = $('#rec-hint');
+      if (h) { h.textContent = hint; clearTimeout(h._t); h._t = setTimeout(() => { h.textContent = ''; }, 2200); }
+    }
+  };
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach((ev) => btn.addEventListener(ev, cancel));
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+}
+
+function showRecordingHelp() {
+  return sheet(`<h3>Ekran kilitliyken kayıt</h3>
+    <p class="small">iPhone, ekran kilitlendiğinde ya da başka uygulamaya geçildiğinde <b>web uygulamalarının</b> (bu uygulama dahil) mikrofonunu kapatır; bu bir iOS kuralıdır ve aşılamaz. Bu yüzden kayıt sırasında ekran açık tutulur ve düğmeler yalnızca <b>basılı tutunca</b> çalışır. Kayıt yine de kesilirse o ana kadarki kısım saklanır.</p>
+    <p><b>Ekran kapalıyken kayıt almak için</b></p>
+    <ol class="small">
+      <li>iPhone'un <b>Ses Notları</b> uygulamasıyla kaydedin (kilitli ekranda çalışır).</li>
+      <li>Kayda dokunun → <b>•••</b> → <b>Dosyalar'a Kaydet</b> (menüde yoksa <b>Paylaş</b> → <b>Dosyalar'a Kaydet</b>).</li>
+      <li>Bu uygulamada <b>Kayıtlar</b> sayfasındaki <b>↑ (İçe aktar)</b> düğmesiyle dosyayı seçin. Konuşmacı ayırma ve metne çevirme yine bu telefonda yapılır.</li>
+    </ol>
+    <p class="small muted">Ses Notları'nın iCloud eşitlemesi açıksa kayıt iCloud'a yüklenir. İstemiyorsanız: Ayarlar → [adınız] → iCloud → Ses Notları'nı kapatın.</p>
+    <p><b>Dokunmatiği tamamen kilitlemek için</b></p>
+    <p class="small">Ayarlar → Erişilebilirlik → <b>Yönlendirmeli Erişim</b>'i açın. Kayıt ekranındayken yan tuşa üç kez basın, “Dokunma”yı kapatıp başlatın: ekran açık kalır, dokunuşlar ve tuşlar çalışmaz, kayıt sürer. Çıkmak için yine üç kez basıp parolanızı girin.</p>
+    <p class="small muted">Başkalarının da konuştuğu kayıtlarda onların haberdar olması gerekir.</p>
+    <div class="btn-row"><button class="btn primary" data-a="ok">Tamam</button></div>`,
+  (el, close) => { $('[data-a=ok]', el).onclick = () => close(); });
+}
 
 function pickMime() {
   const c = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
@@ -410,11 +554,29 @@ async function startRecording() {
   }
   const mime = pickMime();
   const mr = new MediaRecorder(stream, mime ? { mimeType: mime, audioBitsPerSecond: 64000 } : undefined);
-  Object.assign(rec, { mr, stream, chunks: [], startedAt: Date.now(), elapsed: 0, lastTick: performance.now(), paused: false, draftId: uid(), numSpeakers: 0 });
-  mr.ondataavailable = (e) => { if (e.data && e.data.size) rec.chunks.push(e.data); };
+  Object.assign(rec, {
+    mr, stream, chunks: [], startedAt: Date.now(), elapsed: 0, lastTick: performance.now(), paused: false,
+    draftId: uid(), numSpeakers: 0, stopping: false, hiddenAt: 0, lostSec: 0,
+  });
+  mr.ondataavailable = (e) => {
+    if (e.data && e.data.size) rec.chunks.push(e.data);
+    if (document.visibilityState === 'hidden') saveDraftNow(); // arka plandayken her parçayı hemen sakla
+  };
+  mr.addEventListener('error', (e) => recordingInterrupted(`kaydedici hatası: ${e.error?.message || ''}`));
+  const track = stream.getAudioTracks()[0];
+  if (track) {
+    track.addEventListener('mute', () => logEvent('kayıt: mikrofon sistem tarafından sessize alındı'));
+    track.addEventListener('unmute', () => logEvent('kayıt: mikrofon geri geldi'));
+    track.addEventListener('ended', () => recordingInterrupted('mikrofon kapandı'));
+  }
+  rec.onVis = onRecordingVisibility;
+  document.addEventListener('visibilitychange', rec.onVis);
+  window.addEventListener('pagehide', saveDraftNow);
   mr.start(1000);
   await wake(true);
   showRecorder();
+  logEvent(`kayıt başladı (${mr.mimeType || 'varsayılan biçim'}, ekran açık tutma: ${state.wakeMode})`);
+  if (state.wakeMode === 'yok') recWarn('Bu telefon ekranı kendiliğinden kilitleyebilir; kilitlenirse kayıt durur. Kayıt boyunca ekrana ara ara dokunun ya da Ayarlar → Ekran ve Parlaklık → Otomatik Kilit\'i uzatın.');
 
   // Seviye göstergesi
   try {
@@ -466,41 +628,59 @@ function showRecorder() {
       </select>
     </label>
     <div class="ctrls">
-      <button class="round sec" id="rec-cancel" aria-label="İptal">${ICON.x}</button>
-      <button class="round stop" id="rec-stop" aria-label="Bitir"><i></i></button>
-      <button class="round sec" id="rec-pause" aria-label="Duraklat">${ICON.pause}</button>
+      <button class="round sec hold" id="rec-cancel" aria-label="İptal (basılı tutun)">${ICON.x}</button>
+      <button class="round stop hold" id="rec-stop" aria-label="Bitir (basılı tutun)"><i></i></button>
+      <button class="round sec hold" id="rec-pause" aria-label="Duraklat (basılı tutun)">${ICON.pause}</button>
     </div>
-    <p class="privacy">Ses yalnızca bu cihazda kaydedilir ve işlenir; internete gönderilmez. Kayıt boyunca ekranı açık tutun.</p>`;
+    <div class="lockline">🔒 Yanlışlıkla durmasın diye düğmeler yalnızca <b>basılı tutunca</b> çalışır</div>
+    <div class="rec-hint" id="rec-hint" aria-live="polite"></div>
+    <div class="banner hidden" id="rec-warn" role="status"></div>
+    <p class="privacy">Ses yalnızca bu cihazda kaydedilir ve işlenir; internete gönderilmez.<br>
+      Ekranı kilitlemeyin: iPhone kilitli ekranda web uygulamalarının mikrofonunu kapatır.
+      <a href="#" id="rec-help">Ekran kapalıyken kayıt?</a></p>`;
   document.body.append(el);
   $('#rec-nspk', el).onchange = (e) => { rec.numSpeakers = +e.target.value; };
-  $('#rec-stop', el).onclick = () => stopRecording(true);
-  $('#rec-cancel', el).onclick = async () => {
+  $('#rec-help', el).onclick = (e) => { e.preventDefault(); showRecordingHelp(); };
+  holdToActivate($('#rec-stop', el), 1200, () => stopRecording(true), 'Bitirmek için düğmeyi basılı tutun');
+  holdToActivate($('#rec-cancel', el), 1200, async () => {
     if (rec.elapsed > 5 && !(await confirmBox('Kayıt silinsin mi?', 'Bu kayıt kaydedilmeden silinecek.', 'Sil', true))) return;
     stopRecording(false);
-  };
-  $('#rec-pause', el).onclick = (e) => {
-    const b = e.currentTarget;
-    if (rec.paused) { rec.mr.resume(); rec.paused = false; b.innerHTML = ICON.pause; $('.recorder .state').innerHTML = '<span style="color:var(--rec)">●</span> Kaydediliyor'; }
-    else { rec.mr.pause(); rec.paused = true; b.innerHTML = ICON.play; $('.recorder .state').textContent = 'Duraklatıldı'; }
-  };
+  }, 'Kaydı silmek için düğmeyi basılı tutun');
+  const pauseBtn = $('#rec-pause', el);
+  holdToActivate(pauseBtn, 800, () => {
+    if (rec.paused) {
+      rec.mr.resume(); rec.paused = false; rec.lastTick = performance.now(); pauseBtn.innerHTML = ICON.pause;
+      $('.recorder .state').innerHTML = '<span style="color:var(--rec)">●</span> Kaydediliyor';
+    } else {
+      rec.mr.pause(); rec.paused = true; pauseBtn.innerHTML = ICON.play;
+      $('.recorder .state').textContent = '❚❚ Duraklatıldı';
+    }
+  }, 'Duraklatmak/devam etmek için basılı tutun');
 }
 
 async function stopRecording(keep) {
+  if (rec.stopping || !rec.mr) return;
+  rec.stopping = true;
   const { mr, stream } = rec;
+  document.removeEventListener('visibilitychange', rec.onVis);
+  window.removeEventListener('pagehide', saveDraftNow);
   clearInterval(rec.timer);
   cancelAnimationFrame(rec.raf);
   rec.ac?.close?.();
   const done = new Promise((r) => { mr.onstop = r; });
-  try { mr.state !== 'inactive' && mr.stop(); } catch { /* boş */ }
+  try { if (mr.state !== 'inactive') mr.stop(); } catch { /* boş */ }
   await Promise.race([done, sleep(3000)]);
   stream.getTracks().forEach((t) => t.stop());
   $('.recorder')?.remove();
   await wake(false);
   const draftId = rec.draftId;
-  if (!keep) { await db.del('drafts', draftId); return; }
+  rec.mr = null;
+  if (!keep) { await db.del('drafts', draftId); logEvent('kayıt iptal edildi'); return; }
   const blob = new Blob(rec.chunks, { type: mr.mimeType || 'audio/mp4' });
   await db.del('drafts', draftId);
-  await createRecording(blob, { title: `Kayıt – ${fmtDate(rec.startedAt)}`, createdAt: rec.startedAt, duration: rec.elapsed }, { numSpeakers: rec.numSpeakers });
+  if (!blob.size) { toast('Kayıt boş kaldı; kaydedilecek ses yok.', 4000); logEvent('kayıt boş kaldı'); return; }
+  logEvent(`kayıt bitti: ${fmtTime(rec.elapsed)}${rec.lostSec ? `, arka planda ~${Math.round(rec.lostSec)} sn` : ''}`);
+  await createRecording(blob, { title: `Kayıt – ${fmtDate(rec.startedAt)}`, createdAt: rec.startedAt, duration: rec.elapsed, recorded: rec.elapsed }, { numSpeakers: rec.numSpeakers });
 }
 
 async function createRecording(blob, meta, over = {}) {
@@ -509,6 +689,7 @@ async function createRecording(blob, meta, over = {}) {
   const r = {
     id, title: meta.title, createdAt: meta.createdAt || Date.now(), duration: meta.duration || 0,
     status: 'queued', speakers: [], turns: [], summaries: [], chat: [], source: meta.source || 'mic',
+    recordedSec: meta.recorded || 0, // kayıt ekranındaki süre (ses dosyası bundan kısaysa uyarırız)
   };
   await saveRec(r);
   state.recs.unshift(r);
@@ -663,7 +844,8 @@ function renderList() {
   }
   if (!state.recs.length) {
     html += `<div class="empty">${ICON.mic}<p><b>Henüz kayıt yok.</b><br>Aşağıdaki <b>Kaydet</b> düğmesiyle bir konuşma kaydedin ya da sağ üstten bir ses dosyası içe aktarın.</p>
-      <p class="small">İlk işlemede konuşma tanıma modelleri bir kez indirilir (≈${settings.asrModel === 'small' ? 260 : settings.asrModel === 'tiny' ? 50 : 90} MB). Sonrasında her şey internetsiz çalışır.</p></div>`;
+      <p class="small">İlk işlemede konuşma tanıma modelleri bir kez indirilir (≈${settings.asrModel === 'small' ? 260 : settings.asrModel === 'tiny' ? 50 : 90} MB). Sonrasında her şey internetsiz çalışır.</p>
+      <p class="small"><a href="#" id="empty-help">Ekran kapalıyken kayıt almak mı istiyorsunuz?</a></p></div>`;
   } else {
     html += `<input class="search" type="search" placeholder="Kayıtlarda ara (metin, başlık, kişi)" value="${esc(state.search)}" id="search">`;
     if (state.selecting) {
@@ -685,6 +867,7 @@ function renderList() {
   }
   view().innerHTML = html;
   $('#import')?.addEventListener('click', () => $('#file-input').click());
+  $('#empty-help')?.addEventListener('click', (e) => { e.preventDefault(); showRecordingHelp(); });
   $('#sel-toggle')?.addEventListener('click', () => { state.selecting = !state.selecting; state.selected.clear(); renderList(); });
   const s = $('#search');
   if (s) s.addEventListener('input', (e) => {
@@ -768,6 +951,9 @@ function renderStatus(r) {
       <p class="small muted" style="margin:8px 0 0">Sorun sürerse: Ayarlar → Tanılama → “Raporu kopyala” ve bana iletin.</p></div>`;
     $('#retry').onclick = () => enqueue(r.id, { keepNames: true });
     $('#retry-light')?.addEventListener('click', () => enqueue(r.id, { asrModel: 'tiny', keepNames: true }));
+  } else if (r.truncated) {
+    el.innerHTML = `<div class="card"><b>Ses kaydı eksik olabilir</b>
+      <p class="small muted">Kayıt ekranında ${fmtTime(r.recordedSec)} görünüyordu ama kaydedilen ses ${fmtTime(r.duration)} uzunluğunda. Ekran kilitlenmiş ya da iOS'un kayıt bileşeni hata vermiş olabilir. Tekrarlarsa Ayarlar → Tanılama → “Raporu kopyala” ile bana iletin.</p></div>`;
   } else el.innerHTML = '';
 }
 
@@ -1225,6 +1411,7 @@ async function diagnosticsText() {
     `Cihaz: ${/iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : navigator.platform}${ios ? ` · iOS ${ios}` : ''} · ekran ${screen.width}x${screen.height}@${devicePixelRatio}`,
     `Tarayıcı: ${ua}`,
     `Ana ekran uygulaması: ${standalone ? 'evet' : 'hayır'} · WebGPU: ${navigator.gpu ? 'var' : 'yok'} · çekirdek: ${navigator.hardwareConcurrency || '?'} · bellek: ${navigator.deviceMemory ? navigator.deviceMemory + ' GB' : 'bilinmiyor'}`,
+    `Ekran açık tutma: Wake Lock API ${'wakeLock' in navigator ? 'var' : 'yok'} · son kullanılan: ${state.wakeMode} · kayıt biçimi: ${pickMime() || 'varsayılan'}`,
     `Ayarlar: model=${settings.asrModel} işlemci=${settings.device} dil=${settings.language} eşik=${settings.threshold}`,
   ];
   try {
