@@ -786,6 +786,8 @@ async function nativeStartup() {
     if (s.recording) {
       Object.assign(rec, { native: true, nativeId: s.id, startedAt: Date.now() - s.t * 1000, elapsed: s.t, paused: !!s.paused, stopping: false, numSpeakers: 0 });
       showRecorder();
+      $('.recorder .clock').textContent = fmtTime(s.t); // ilk süre olayını beklemeden göster
+      if (rec.paused) { $('#rec-pause').innerHTML = ICON.play; $('.recorder .state').textContent = '❚❚ Duraklatıldı'; }
       attachNativeRecorderUI();
       logEvent('süren yerel kayda geri dönüldü');
       return;

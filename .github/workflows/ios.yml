@@ -46,3 +46,52 @@ jobs:
           name: KonusmaDefteri-imzasiz-ipa
           path: out/KonusmaDefteri-imzasiz.ipa
           retention-days: 30
+
+  # Apple Developer hesabı bağlanınca (depo gizli değerleri eklenince) imzalayıp TestFlight'a yükler.
+  # Gerekli gizli değerler: ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (App Store Connect API anahtarı),
+  # APPLE_TEAM_ID. Bunlar yoksa bu iş atlanır.
+  testflight:
+    needs: build
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Apple anahtarları var mı?
+        id: check
+        run: |
+          if [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] && [ -n "$ASC_KEY_P8" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Apple gizli değerleri tanımlı değil; TestFlight adımı atlandı."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.ok == 'true'
+
+      - name: Arşivle, imzala ve TestFlight'a yükle
+        if: steps.check.outputs.ok == 'true'
+        shell: bash
+        run: |
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s' "$ASC_KEY_P8" > "$KEY_PATH"
+          AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$KEY_PATH" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          brew install xcodegen
+          (cd ios && xcodegen generate)
+          xcodebuild -quiet -project ios/KonusmaDefteri.xcodeproj -scheme KonusmaDefteri \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/KonusmaDefteri.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            "${AUTH[@]}" archive
+          cp ios/ExportOptions.plist "$RUNNER_TEMP/ExportOptions.plist"
+          /usr/libexec/PlistBuddy -c "Add :teamID string $APPLE_TEAM_ID" "$RUNNER_TEMP/ExportOptions.plist"
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/KonusmaDefteri.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
+            "${AUTH[@]}"
+          rm -f "$KEY_PATH"
+          echo "::notice::Yükleme tamamlandı. App Store Connect işledikten sonra (10–30 dk) TestFlight'ta görünür."

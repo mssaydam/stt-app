@@ -62,6 +62,24 @@ Bu yüzden (1.3 sürümü):
 - **Dokunmatiği tamamen kilitlemek için:** Ayarlar → Erişilebilirlik → **Yönlendirmeli Erişim**; kayıt
   ekranında yan tuşa üç kez basıp "Dokunma"yı kapatın.
 
+## iPhone uygulaması (yerel kabuk — kilitli ekranda kayıt)
+
+`ios/` klasörü, bu web uygulamasını açan küçük bir Swift uygulamasıdır. Tek farkı kaydı iPhone'un
+kendi kayıt bileşeniyle yapmasıdır (AVAudioRecorder, “arka planda ses” izni): **ekran kilitliyken de
+kayıt sürer** ve iOS bu sırada kırmızı kayıt göstergesini gösterir. Konuşmacı ayırma, metne çevirme ve
+Claude bölümleri aynıdır; site güncellenince uygulama da güncellenir. Kayıt 16 kHz mono AAC olarak
+uygulamanın klasörüne yazılır, sayfaya aktarılıp saklandıktan sonra silinir (aktarım yarıda kalırsa
+açılışta kurtarılır). Telefon araması gibi kesintilerde kayıt duraklar ve sonra devam eder.
+
+- **Derleme:** `.github/workflows/ios.yml` (GitHub Actions, macOS, XcodeGen). Her gönderimde imzasız
+  `.ipa` üretir (Actions → çalıştırma → Artifacts).
+- **Kurulum Apple imzası ister:**
+  - **TestFlight (önerilen, yalnızca telefonla yapılabilir):** Apple Developer Program (yıllık 99 $) →
+    App Store Connect'te `io.github.mssaydam.konusma` paket kimliğiyle uygulama kaydı → App Store Connect
+    API anahtarı → bu deponun Actions gizli değerleri: `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8`
+    (.p8 dosyasının içeriği), `APPLE_TEAM_ID`. Bunlar eklenince iş akışı imzalayıp TestFlight'a yükler.
+  - **Ücretsiz:** Windows/Mac'te Sideloadly + Apple kimliğiyle imzasız `.ipa` kurulur; 7 günde bir yenilenmesi gerekir.
+
 ## Model seçimi, hız ve bellek
 
 | Model | İndirme | Türkçe kelime hatası (WER)† | İşlem sırasında tepe bellek* | Süre* |
