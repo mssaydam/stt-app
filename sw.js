@@ -2,7 +2,7 @@
 // Model dosyaları transformers.js tarafından ayrıca "transformers-cache" içinde saklanır.
 // Claude API ve Hugging Face isteklerine dokunulmaz.
 
-const VERSION = 'kd-v4';
+const VERSION = 'kd-v5';
 const APP_FILES = [
   './',
   './index.html',

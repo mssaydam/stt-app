@@ -30,7 +30,7 @@ const ICON = {
 // ====================================================================
 // Ayarlar (yalnızca bu cihazda, localStorage)
 // ====================================================================
-export const APP_VERSION = '1.3.0';
+export const APP_VERSION = '1.4.0';
 const DEFAULTS = {
   v: 3,
   asrModel: 'base-tr',       // base-tr (Türkçe) | tiny | base | small
@@ -419,6 +419,7 @@ function jobLabel() {
 const rec = {
   mr: null, stream: null, chunks: [], startedAt: 0, elapsed: 0, lastTick: 0, paused: false, ac: null, raf: 0, timer: 0,
   draftId: null, numSpeakers: 0, stopping: false, hiddenAt: 0, lostSec: 0, onVis: null,
+  native: false, nativeId: null, nativeFn: null, // yerel iOS kabuğu kaydı
 };
 
 /** Kayıt sürerken eldeki parçaları hemen (çökmeye/kapanmaya karşı) sakla. */
@@ -534,6 +535,7 @@ function pickMime() {
 }
 
 async function startRecording() {
+  if (nativeBridge()) return startNativeRecording(); // yerel iOS kabuğu: kilitli ekranda da kaydeder
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
     toast('Bu tarayıcı ses kaydını desteklemiyor.', 4000);
     return;
@@ -636,11 +638,12 @@ function showRecorder() {
     <div class="rec-hint" id="rec-hint" aria-live="polite"></div>
     <div class="banner hidden" id="rec-warn" role="status"></div>
     <p class="privacy">Ses yalnızca bu cihazda kaydedilir ve işlenir; internete gönderilmez.<br>
-      Ekranı kilitlemeyin: iPhone kilitli ekranda web uygulamalarının mikrofonunu kapatır.
-      <a href="#" id="rec-help">Ekran kapalıyken kayıt?</a></p>`;
+      ${rec.native
+        ? 'Ekranı kilitleyebilirsiniz; kayıt sürer. Kayıt boyunca iPhone kırmızı kayıt göstergesini gösterir.'
+        : 'Ekranı kilitlemeyin: iPhone kilitli ekranda web uygulamalarının mikrofonunu kapatır. <a href="#" id="rec-help">Ekran kapalıyken kayıt?</a>'}</p>`;
   document.body.append(el);
   $('#rec-nspk', el).onchange = (e) => { rec.numSpeakers = +e.target.value; };
-  $('#rec-help', el).onclick = (e) => { e.preventDefault(); showRecordingHelp(); };
+  $('#rec-help', el)?.addEventListener('click', (e) => { e.preventDefault(); showRecordingHelp(); });
   holdToActivate($('#rec-stop', el), 1200, () => stopRecording(true), 'Bitirmek için düğmeyi basılı tutun');
   holdToActivate($('#rec-cancel', el), 1200, async () => {
     if (rec.elapsed > 5 && !(await confirmBox('Kayıt silinsin mi?', 'Bu kayıt kaydedilmeden silinecek.', 'Sil', true))) return;
@@ -649,16 +652,160 @@ function showRecorder() {
   const pauseBtn = $('#rec-pause', el);
   holdToActivate(pauseBtn, 800, () => {
     if (rec.paused) {
-      rec.mr.resume(); rec.paused = false; rec.lastTick = performance.now(); pauseBtn.innerHTML = ICON.pause;
+      if (rec.native) nativeCall({ cmd: 'resume' }); else rec.mr.resume();
+      rec.paused = false; rec.lastTick = performance.now(); pauseBtn.innerHTML = ICON.pause;
       $('.recorder .state').innerHTML = '<span style="color:var(--rec)">●</span> Kaydediliyor';
     } else {
-      rec.mr.pause(); rec.paused = true; pauseBtn.innerHTML = ICON.play;
+      if (rec.native) nativeCall({ cmd: 'pause' }); else rec.mr.pause();
+      rec.paused = true; pauseBtn.innerHTML = ICON.play;
       $('.recorder .state').textContent = '❚❚ Duraklatıldı';
     }
   }, 'Duraklatmak/devam etmek için basılı tutun');
 }
 
+// ====================================================================
+// Yerel iOS kabuğu (App Store / TestFlight sürümü): iPhone'un kendi kayıt bileşeni.
+// Kabuk `window.KD_NATIVE` ve `webkit.messageHandlers.kdNative` köprüsünü sağlar;
+// ekran kilitliyken de kayıt sürer. Sayfa kabuk dışında açılırsa bu bölüm hiç çalışmaz.
+// ====================================================================
+const nativeBridge = () => (window.KD_NATIVE && window.webkit?.messageHandlers?.kdNative) || null;
+const nativeListeners = new Set();
+window.KD_NATIVE_EVENT = (ev) => { for (const fn of [...nativeListeners]) { try { fn(ev); } catch (e) { console.error(e); } } };
+function nativeCall(msg) { nativeBridge()?.postMessage(msg); }
+
+function waitNative(pred, ms = 15000) {
+  return new Promise((resolve, reject) => {
+    const fn = (ev) => {
+      if (ev.type === 'error') { nativeListeners.delete(fn); clearTimeout(t); reject(new Error(ev.message)); }
+      else if (pred(ev)) { nativeListeners.delete(fn); clearTimeout(t); resolve(ev); }
+    };
+    const t = setTimeout(() => { nativeListeners.delete(fn); reject(new Error('Telefonun kayıt bileşeni yanıt vermedi.')); }, ms);
+    nativeListeners.add(fn);
+  });
+}
+
+/** Yerel kabuğun parça parça gönderdiği kayıt dosyasını topla → Blob */
+function collectNativeFile(id) {
+  return new Promise((resolve, reject) => {
+    const parts = [];
+    const fn = (ev) => {
+      if (ev.type === 'chunk' && ev.id === id) {
+        const bin = atob(ev.b64);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        parts[ev.i] = u8;
+      } else if (ev.type === 'done' && ev.id === id) {
+        nativeListeners.delete(fn);
+        resolve({ blob: new Blob(parts, { type: ev.mime || 'audio/mp4' }), duration: ev.duration || 0 });
+      } else if (ev.type === 'error') {
+        nativeListeners.delete(fn);
+        reject(new Error(ev.message));
+      }
+    };
+    nativeListeners.add(fn);
+  });
+}
+
+function attachNativeRecorderUI() {
+  const bars = $$('.meter i');
+  const hist = new Array(bars.length).fill(0);
+  rec.nativeFn = (ev) => {
+    if (ev.type === 'state') {
+      rec.elapsed = ev.t;
+      const c = $('.recorder .clock');
+      if (c) c.textContent = fmtTime(ev.t);
+      hist.push(ev.paused ? 0 : ev.level); hist.shift();
+      bars.forEach((b, i) => { b.style.height = `${4 + Math.min(1, hist[i] * 2.2) * 76}px`; });
+    } else if (ev.type === 'interrupted') {
+      logEvent('kayıt: arama/başka uygulama nedeniyle duraklatıldı');
+      recWarn('Bir arama ya da başka bir uygulama kaydı duraklattı; bitince kendiliğinden devam eder.');
+    } else if (ev.type === 'resumed') {
+      $('#rec-warn')?.classList.add('hidden');
+    } else if (ev.type === 'error') {
+      toast(ev.message, 6000);
+      logEvent(`yerel kayıt hatası: ${ev.message}`);
+    }
+  };
+  nativeListeners.add(rec.nativeFn);
+}
+
+async function startNativeRecording() {
+  if (rec.native) return;
+  Object.assign(rec, {
+    native: true, mr: null, stream: null, chunks: [], startedAt: Date.now(), elapsed: 0, paused: false,
+    numSpeakers: 0, stopping: false, lostSec: 0, nativeId: null,
+  });
+  const started = waitNative((ev) => ev.type === 'started');
+  nativeCall({ cmd: 'start' });
+  try {
+    rec.nativeId = (await started).id;
+  } catch (err) {
+    rec.native = false;
+    toast(err.message, 6000);
+    logEvent(`yerel kayıt başlatılamadı: ${err.message}`);
+    return;
+  }
+  showRecorder();
+  attachNativeRecorderUI();
+  logEvent('kayıt başladı (yerel iOS kaydedici; ekran kilitliyken sürer)');
+}
+
+async function stopNativeRecording(keep) {
+  if (rec.stopping) return;
+  rec.stopping = true;
+  nativeListeners.delete(rec.nativeFn);
+  const id = rec.nativeId;
+  $('.recorder')?.remove();
+  try {
+    if (!keep) { nativeCall({ cmd: 'cancel' }); logEvent('kayıt iptal edildi'); return; }
+    toast('Kayıt aktarılıyor…');
+    const file = collectNativeFile(id);
+    nativeCall({ cmd: 'stop' });
+    const { blob, duration } = await file;
+    if (!blob.size) { toast('Kayıt boş kaldı.'); nativeCall({ cmd: 'discard', id }); return; }
+    const secs = duration || rec.elapsed;
+    logEvent(`kayıt bitti (yerel): ${fmtTime(secs)}, ${(blob.size / 1e6).toFixed(1)} MB`);
+    await createRecording(blob, { title: `Kayıt – ${fmtDate(rec.startedAt)}`, createdAt: rec.startedAt, duration: secs, recorded: secs }, { numSpeakers: rec.numSpeakers });
+    nativeCall({ cmd: 'ack', id }); // web tarafı sakladı → telefondaki geçici dosyayı sil
+  } catch (err) {
+    logEvent(`yerel kayıt aktarılamadı: ${err.message}`);
+    toast(`Kayıt aktarılamadı: ${err.message} Kayıt telefonda saklandı; uygulamayı yeniden açınca kurtarılır.`, 8000);
+  } finally {
+    rec.native = false;
+    rec.nativeId = null;
+  }
+}
+
+/** Açılışta: süren bir yerel kayıt varsa ekranına dön; aktarılmamış kayıtları kurtar. */
+async function nativeStartup() {
+  if (!nativeBridge()) return;
+  try {
+    const st = waitNative((ev) => ev.type === 'status', 5000);
+    nativeCall({ cmd: 'status' });
+    const s = await st;
+    if (s.recording) {
+      Object.assign(rec, { native: true, nativeId: s.id, startedAt: Date.now() - s.t * 1000, elapsed: s.t, paused: !!s.paused, stopping: false, numSpeakers: 0 });
+      showRecorder();
+      attachNativeRecorderUI();
+      logEvent('süren yerel kayda geri dönüldü');
+      return;
+    }
+    const pend = waitNative((ev) => ev.type === 'pending', 5000);
+    nativeCall({ cmd: 'listPending' });
+    for (const id of (await pend).ids || []) {
+      const ok = await confirmBox('Aktarılmamış kayıt bulundu', 'Telefonda, uygulamaya aktarılamamış bir kayıt var. Şimdi aktarılsın mı?', 'Aktar');
+      if (!ok) { nativeCall({ cmd: 'discard', id }); continue; }
+      const file = collectNativeFile(id);
+      nativeCall({ cmd: 'fetch', id });
+      const { blob } = await file;
+      await createRecording(blob, { title: `Kurtarılan kayıt – ${fmtDate(Date.now())}`, createdAt: Date.now() }, {});
+      nativeCall({ cmd: 'ack', id });
+    }
+  } catch (err) { logEvent(`yerel açılış kontrolü: ${err.message}`); }
+}
+
 async function stopRecording(keep) {
+  if (rec.native) return stopNativeRecording(keep);
   if (rec.stopping || !rec.mr) return;
   rec.stopping = true;
   const { mr, stream } = rec;
@@ -845,7 +992,7 @@ function renderList() {
   if (!state.recs.length) {
     html += `<div class="empty">${ICON.mic}<p><b>Henüz kayıt yok.</b><br>Aşağıdaki <b>Kaydet</b> düğmesiyle bir konuşma kaydedin ya da sağ üstten bir ses dosyası içe aktarın.</p>
       <p class="small">İlk işlemede konuşma tanıma modelleri bir kez indirilir (≈${settings.asrModel === 'small' ? 260 : settings.asrModel === 'tiny' ? 50 : 90} MB). Sonrasında her şey internetsiz çalışır.</p>
-      <p class="small"><a href="#" id="empty-help">Ekran kapalıyken kayıt almak mı istiyorsunuz?</a></p></div>`;
+      ${nativeBridge() ? '<p class="small">Bu uygulamada ekran kilitliyken de kayıt sürer.</p>' : '<p class="small"><a href="#" id="empty-help">Ekran kapalıyken kayıt almak mı istiyorsunuz?</a></p>'}</div>`;
   } else {
     html += `<input class="search" type="search" placeholder="Kayıtlarda ara (metin, başlık, kişi)" value="${esc(state.search)}" id="search">`;
     if (state.selecting) {
@@ -1412,6 +1559,7 @@ async function diagnosticsText() {
     `Tarayıcı: ${ua}`,
     `Ana ekran uygulaması: ${standalone ? 'evet' : 'hayır'} · WebGPU: ${navigator.gpu ? 'var' : 'yok'} · çekirdek: ${navigator.hardwareConcurrency || '?'} · bellek: ${navigator.deviceMemory ? navigator.deviceMemory + ' GB' : 'bilinmiyor'}`,
     `Ekran açık tutma: Wake Lock API ${'wakeLock' in navigator ? 'var' : 'yok'} · son kullanılan: ${state.wakeMode} · kayıt biçimi: ${pickMime() || 'varsayılan'}`,
+    `Yerel iOS kabuğu: ${nativeBridge() ? `evet (${window.KD_NATIVE?.platform || '?'} v${window.KD_NATIVE?.version || '?'}) — kilitli ekranda kayıt` : 'hayır (web uygulaması)'}`,
     `Ayarlar: model=${settings.asrModel} işlemci=${settings.device} dil=${settings.language} eşik=${settings.threshold}`,
   ];
   try {
@@ -1632,6 +1780,7 @@ async function init() {
   window.addEventListener('hashchange', render);
   render();
   recoverDrafts();
+  nativeStartup();
 
   if ('serviceWorker' in navigator && window.isSecureContext) {
     navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW', e));

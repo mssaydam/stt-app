@@ -1,0 +1,48 @@
+name: iOS uygulaması (derleme)
+
+on:
+  push:
+    branches: [main, claude/upbeat-allen-0128ab]
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode sürümü
+        run: xcodebuild -version
+
+      - name: Xcode projesini üret (XcodeGen)
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      - name: Derle (imzasız)
+        shell: bash
+        run: |
+          xcodebuild -quiet \
+            -project ios/KonusmaDefteri.xcodeproj -scheme KonusmaDefteri \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: IPA paketi (imzasız)
+        run: |
+          mkdir -p out/Payload
+          cp -R build/Build/Products/Release-iphoneos/KonusmaDefteri.app out/Payload/
+          /usr/libexec/PlistBuddy -c 'Print' out/Payload/KonusmaDefteri.app/Info.plist | head -40
+          cd out && zip -qry KonusmaDefteri-imzasiz.ipa Payload && ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KonusmaDefteri-imzasiz-ipa
+          path: out/KonusmaDefteri-imzasiz.ipa
+          retention-days: 30
